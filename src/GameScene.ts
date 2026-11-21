@@ -2,6 +2,8 @@ import Phaser from 'phaser';
 import type { EnemyType, Ghost, GhostRole, Implant, State, Stats } from './types';
 import { IMPLANTS } from './data/implants';
 import { ENEMY } from './data/enemies';
+import { loadGhosts, saveGhost } from './storage';
+import { sfx } from './sfx';
 
 const TOTAL_WAVES = 5; // MVP: 5 waves (depois 10 + modo infinito)
 const WAVE_TIME = 45; // segundos (depois 60-120)
@@ -15,19 +17,50 @@ const ROLE_LABEL: Record<Exclude<GhostRole, 'none'>, string> = {
   boss: 'BOSS',
 };
 
+type FxKey = EnemyType | 'ghost' | 'player';
+type EndKind = 'dead' | 'win' | 'psycho';
+
+const FX_COLOR: Record<FxKey, number> = {
+  normal: 0xff2a6d,
+  fast: 0xff9e00,
+  tank: 0xb14aed,
+  ghost: 0x05d9e8,
+  player: 0x00f0ff,
+};
+
+const W = 960;
+const H = 540;
+const SPAWN_MIN_DIST = 220; // inimigos não nascem em cima do jogador
+const SPAWN_TELEGRAPH = 450; // ms "fantasma" antes de poder causar dano
+
 export class GameScene extends Phaser.Scene {
   private player!: Phaser.Physics.Arcade.Sprite;
   private bullets!: Phaser.Physics.Arcade.Group;
   private enemies!: Phaser.Physics.Arcade.Group;
   private keys!: Record<string, Phaser.Input.Keyboard.Key>;
+
+  // o mundo e a interface ficam em camadas e câmeras separadas: o shake mexe só no mundo
+  private worldLayer!: Phaser.GameObjects.Layer;
+  private uiLayer!: Phaser.GameObjects.Layer;
+  private uiCam!: Phaser.Cameras.Scene2D.Camera;
+  private fx!: Record<FxKey, Phaser.GameObjects.Particles.ParticleEmitter>;
+
   private hud!: Phaser.GameObjects.Text;
   private msg!: Phaser.GameObjects.Text;
+  private msgBg!: Phaser.GameObjects.Rectangle;
+  private banner!: Phaser.GameObjects.Text;
+  private bannerTween: Phaser.Tweens.Tween | null = null;
+  private hint!: Phaser.GameObjects.Text;
 
   private state: State = 'wave';
   private wave = 1;
   private timeLeft = WAVE_TIME;
+  private overtime = false;
   private nextShot = 0;
   private iframeUntil = 0;
+  private movedOnce = false;
+  private shotOnce = false;
+  private hintDone = false;
   private stats: Stats = { ...START };
   private implants: string[] = [];
   private shopItems: (Implant | null)[] = [];
@@ -45,12 +78,28 @@ export class GameScene extends Phaser.Scene {
     super('game');
   }
 
+  // ---------- helpers de camada ----------
+  private world<T extends Phaser.GameObjects.GameObject>(o: T): T {
+    this.worldLayer.add(o);
+    return o;
+  }
+
+  private ui<T extends Phaser.GameObjects.GameObject>(o: T): T {
+    this.uiLayer.add(o);
+    return o;
+  }
+
   create() {
     this.state = 'wave';
     this.wave = 1;
     this.timeLeft = WAVE_TIME;
+    this.overtime = false;
     this.nextShot = 0;
     this.iframeUntil = 0;
+    this.movedOnce = false;
+    this.shotOnce = false;
+    this.hintDone = false;
+    this.bannerTween = null;
     this.stats = { ...START };
     this.implants = [];
     this.shopItems = [];
@@ -66,6 +115,12 @@ export class GameScene extends Phaser.Scene {
     this.physics.resume();
     this.time.paused = false;
 
+    this.worldLayer = this.add.layer();
+    this.uiLayer = this.add.layer();
+    this.uiCam = this.cameras.add(0, 0, W, H);
+    this.cameras.main.ignore(this.uiLayer);
+    this.uiCam.ignore(this.worldLayer);
+
     // placeholders: quadrados coloridos (troca por pixel art depois)
     const g = this.add.graphics();
     const tex = (key: string, color: number, size: number) => {
@@ -80,6 +135,7 @@ export class GameScene extends Phaser.Scene {
     tex('ef', 0xff9e00, 10);
     tex('et', 0xb14aed, 24);
     tex('b', 0xf5e642, 6);
+    tex('w', 0xffffff, 4); // partículas (recebem tint)
     if (!this.textures.exists('eg')) {
       g.clear();
       g.fillStyle(0x05d9e8);
@@ -90,10 +146,32 @@ export class GameScene extends Phaser.Scene {
     }
     g.destroy();
 
-    this.player = this.physics.add.sprite(480, 270, 'p').setCollideWorldBounds(true);
+    const mkFx = (color: number) =>
+      this.world(
+        this.add.particles(0, 0, 'w', {
+          speed: { min: 50, max: 190 },
+          lifespan: { min: 220, max: 480 },
+          scale: { start: 1.6, end: 0 },
+          alpha: { start: 1, end: 0 },
+          tint: color,
+          emitting: false,
+        }),
+      );
+    this.fx = {
+      normal: mkFx(FX_COLOR.normal),
+      fast: mkFx(FX_COLOR.fast),
+      tank: mkFx(FX_COLOR.tank),
+      ghost: mkFx(FX_COLOR.ghost),
+      player: mkFx(FX_COLOR.player),
+    };
+
+    this.player = this.world(this.physics.add.sprite(480, 270, 'p').setCollideWorldBounds(true));
     this.bullets = this.physics.add.group();
     this.enemies = this.physics.add.group();
-    this.keys = this.input.keyboard!.addKeys('W,A,S,D,ONE,TWO,THREE,SPACE,R,ESC') as Record<string, Phaser.Input.Keyboard.Key>;
+    this.keys = this.input.keyboard!.addKeys('W,A,S,D,ONE,TWO,THREE,SPACE,R,ESC,M') as Record<
+      string,
+      Phaser.Input.Keyboard.Key
+    >;
 
     this.physics.add.overlap(this.bullets, this.enemies, (b, e) =>
       this.hitEnemy(b as Phaser.GameObjects.GameObject, e as Phaser.GameObjects.GameObject),
@@ -102,13 +180,15 @@ export class GameScene extends Phaser.Scene {
 
     this.time.addEvent({ delay: 450, loop: true, callback: () => this.spawn() });
 
+    // pausa sozinho se a janela perder o foco
+    const onBlur = () => {
+      if (this.state === 'wave') this.openPauseMenu();
+    };
+    this.game.events.on(Phaser.Core.Events.BLUR, onBlur);
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => this.game.events.off(Phaser.Core.Events.BLUR, onBlur));
+
     // sorteia um fantasma salvo (ou fallback inicial) e define como mini-boss ou boss por sorteio ponderado pela pontuação
-    let ghosts: Ghost[] = [];
-    try {
-      ghosts = JSON.parse(localStorage.getItem('ghosts') ?? '[]');
-    } catch {
-      ghosts = [];
-    }
+    const ghosts = loadGhosts();
     const ghostPool: Ghost[] = ghosts.length > 0
       ? ghosts
       : [{ score: 700, wave: 3, implants: ['Mantis Blades', 'Subdermal Armor'] }];
@@ -117,18 +197,39 @@ export class GameScene extends Phaser.Scene {
     this.ghostRole = this.pickGhostRole(this.ghost.score);
     this.ghostWave = this.ghostRole === 'boss' ? TOTAL_WAVES : Math.ceil(TOTAL_WAVES / 2);
 
+    // interface (câmera própria, nunca treme)
     const style = { fontFamily: 'monospace', fontSize: '14px', color: '#9ef' };
-    this.hud = this.add.text(10, 8, '', style).setDepth(10);
-    this.msg = this.add
-      .text(480, 270, '', { ...style, fontSize: '20px', align: 'center' })
-      .setOrigin(0.5)
-      .setDepth(10);
+    this.hud = this.ui(this.add.text(10, 8, '', style).setDepth(10));
+    this.msgBg = this.ui(
+      this.add.rectangle(480, 270, 10, 10, 0x05050a, 0.82).setStrokeStyle(2, 0x00f0ff, 0.6).setDepth(9).setVisible(false),
+    );
+    this.msg = this.ui(this.add.text(480, 270, '', { ...style, fontSize: '20px', align: 'center' }).setOrigin(0.5).setDepth(10));
+    this.banner = this.ui(
+      this.add
+        .text(480, 96, '', { fontFamily: 'monospace', fontSize: '28px', color: '#00f0ff', stroke: '#05050a', strokeThickness: 4 })
+        .setOrigin(0.5)
+        .setDepth(11)
+        .setAlpha(0),
+    );
+    this.hint = this.ui(
+      this.add
+        .text(480, 520, 'WASD mover  ·  mouse mira e atira  ·  ESC pausa  ·  M som', { ...style, fontSize: '13px', color: '#7a8fa6' })
+        .setOrigin(0.5)
+        .setDepth(10),
+    );
 
+    this.showBanner('WAVE 1');
+    sfx.waveStart();
     this.scheduleGhostIfNeeded();
   }
 
   update(time: number, delta: number) {
     this.updateHud();
+
+    if (Phaser.Input.Keyboard.JustDown(this.keys.M)) {
+      this.showBanner(sfx.toggleMute() ? 'SOM LIGADO' : 'SOM DESLIGADO', '#9ef', 900);
+    }
+
     if (this.state === 'over') {
       if (Phaser.Input.Keyboard.JustDown(this.keys.R)) this.scene.restart();
       return;
@@ -177,11 +278,16 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
+    // i-frames visíveis: o jogador pisca enquanto está invulnerável
+    const now = this.time.now;
+    this.player.setAlpha(now < this.iframeUntil && Math.floor(now / 70) % 2 ? 0.25 : 1);
+
     // movimento WASD
     const dir = new Phaser.Math.Vector2(
       Number(this.keys.D.isDown) - Number(this.keys.A.isDown),
       Number(this.keys.S.isDown) - Number(this.keys.W.isDown),
     );
+    if (dir.lengthSq() > 0) this.movedOnce = true;
     dir.normalize().scale(this.stats.speed);
     this.player.setVelocity(dir.x, dir.y);
 
@@ -189,10 +295,18 @@ export class GameScene extends Phaser.Scene {
     const p = this.input.activePointer;
     if (p.isDown && time > this.nextShot) {
       this.nextShot = time + this.stats.fireDelay;
+      this.shotOnce = true;
       const angle = Phaser.Math.Angle.Between(this.player.x, this.player.y, p.worldX, p.worldY);
-      const b = this.bullets.create(this.player.x, this.player.y, 'b') as Phaser.Physics.Arcade.Sprite;
+      const b = this.world(this.bullets.create(this.player.x, this.player.y, 'b') as Phaser.Physics.Arcade.Sprite);
       this.physics.velocityFromRotation(angle, 520, b.body!.velocity);
       this.time.delayedCall(900, () => b.active && b.destroy());
+      sfx.shoot();
+    }
+
+    // a dica de controles some quando o jogador já fez as duas coisas
+    if (!this.hintDone && this.movedOnce && this.shotOnce) {
+      this.hintDone = true;
+      this.tweens.add({ targets: this.hint, alpha: 0, duration: 600 });
     }
 
     // inimigos perseguem o jogador
@@ -210,15 +324,69 @@ export class GameScene extends Phaser.Scene {
     }
 
     this.timeLeft -= delta / 1000;
-    if (this.timeLeft <= 0) this.endWave();
+    if (this.timeLeft <= 0) {
+      // na wave do boss o tempo não basta: é preciso derrotar o fantasma para vencer
+      if (this.ghostRole === 'boss' && this.wave === this.ghostWave && !this.ghostDefeated) {
+        this.timeLeft = 0;
+        if (!this.overtime) {
+          this.overtime = true;
+          this.showBanner('DERROTE O FANTASMA PARA VENCER', '#ff2a6d', 0);
+        }
+      } else {
+        this.endWave();
+      }
+    }
   }
 
+  // ---------- feedback ----------
+  private burst(key: FxKey, x: number, y: number, count: number) {
+    this.fx[key].emitParticleAt(x, y, count);
+  }
+
+  private floatText(x: number, y: number, text: string, color: string, size = 12) {
+    const t = this.world(
+      this.add
+        .text(x, y, text, { fontFamily: 'monospace', fontSize: `${size}px`, color, stroke: '#05050a', strokeThickness: 3 })
+        .setOrigin(0.5)
+        .setDepth(20),
+    );
+    this.tweens.add({ targets: t, y: y - 26, alpha: 0, duration: 700, onComplete: () => t.destroy() });
+  }
+
+  private showBanner(text: string, color = '#00f0ff', holdMs = 1400) {
+    this.bannerTween?.stop();
+    this.bannerTween = null;
+    this.banner.setText(text).setColor(color).setAlpha(1).setScale(1.25);
+    this.tweens.add({ targets: this.banner, scale: 1, duration: 150 });
+    if (holdMs > 0) {
+      this.bannerTween = this.tweens.add({ targets: this.banner, alpha: 0, delay: holdMs, duration: 300 });
+    }
+  }
+
+  private hideBanner() {
+    this.bannerTween?.stop();
+    this.bannerTween = null;
+    this.banner.setAlpha(0);
+  }
+
+  // painel atrás do texto grande, para ler por cima do jogo
+  private setMsg(text: string) {
+    this.msg.setText(text);
+    if (!text) {
+      this.msgBg.setVisible(false);
+      return;
+    }
+    this.msgBg.setSize(this.msg.width + 48, this.msg.height + 36).setVisible(true);
+  }
+
+  // ---------- menus ----------
   private openPauseMenu() {
     this.state = 'pause';
     this.physics.pause();
     this.time.paused = true;
     this.player.setVelocity(0, 0);
-    this.msg.setText(
+    sfx.click();
+    this.setMsg(
       '=== JOGO PAUSADO ===\n\n' +
         '[1] Continuar\n' +
         '[2] Ver Build\n' +
@@ -231,7 +399,8 @@ export class GameScene extends Phaser.Scene {
     this.state = 'wave';
     this.physics.resume();
     this.time.paused = false;
-    this.msg.setText('');
+    sfx.click();
+    this.setMsg('');
   }
 
   private openBuildMenu() {
@@ -250,7 +419,7 @@ export class GameScene extends Phaser.Scene {
         ? implantEntries.map(([name, count]) => `• ${name} x${count}`).join('\n')
         : 'Nenhum implante instalado';
 
-    this.msg.setText(
+    this.setMsg(
       '=== DADOS DA RUN (BUILD) ===\n\n' +
         `HP: ${Math.max(0, Math.round(s.hp))}/${s.maxHp}   |   Dano: ${s.damage}\n` +
         `Velocidade: ${s.speed}   |   Cadência: ${s.fireDelay}ms (${shotsPerSec} tiros/s)\n` +
@@ -263,7 +432,7 @@ export class GameScene extends Phaser.Scene {
 
   private openConfirmRestartMenu() {
     this.state = 'confirm_restart';
-    this.msg.setText(
+    this.setMsg(
       '=== REINICIAR RUN? ===\n\n' +
         'Tem certeza que deseja reiniciar a run?\n' +
         'O progresso da run atual será perdido.\n' +
@@ -273,6 +442,7 @@ export class GameScene extends Phaser.Scene {
     );
   }
 
+  // ---------- fantasma ----------
   private pickGhostRole(score: number): 'miniboss' | 'boss' {
     // pontuação alta -> mais chance de boss final; pontuação baixa -> mais chance de mini-boss
     const weights: ['miniboss' | 'boss', number][] =
@@ -301,9 +471,7 @@ export class GameScene extends Phaser.Scene {
   private spawnGhost() {
     if (!this.ghost || this.ghostRole === 'none') return;
     const role = this.ghostRole;
-    const side = Phaser.Math.Between(0, 3);
-    const x = side === 0 ? 16 : side === 1 ? 944 : Phaser.Math.Between(40, 920);
-    const y = side === 2 ? 16 : side === 3 ? 524 : Phaser.Math.Between(40, 500);
+    const { x, y } = this.edgePoint(SPAWN_MIN_DIST, 16);
 
     // escala o fantasma para a curva de poder da wave em que aparece e a pontuação salva
     const scoreFactor = Phaser.Math.Clamp(this.ghost.score / 800, 0.8, 1.4);
@@ -327,27 +495,28 @@ export class GameScene extends Phaser.Scene {
     const hp = Math.round(baseHp * scoreFactor * hpMod);
     const dmg = Math.round(baseDmg * dmgMod);
     const mul = Number((baseMul * speedMod).toFixed(2));
-    const reward = baseReward;
 
-    const g = this.enemies.create(x, y, 'eg') as Phaser.Physics.Arcade.Sprite;
+    const g = this.world(this.enemies.create(x, y, 'eg') as Phaser.Physics.Arcade.Sprite);
     g.setScale(scale);
     g.setData('hp', hp);
     g.setData('maxHp', hp);
     g.setData('mul', mul);
     g.setData('dmg', dmg);
-    g.setData('reward', reward);
+    g.setData('reward', baseReward);
     g.setData('isGhost', true);
+    g.setData('fx', 'ghost');
+    this.armEnemy(g, 800);
     this.ghostEnemy = g;
 
-    this.ghostLabel = this.add
-      .text(x, y - 24, '', { fontFamily: 'monospace', fontSize: '12px', color: '#ff2a6d', backgroundColor: '#050814' })
-      .setOrigin(0.5)
-      .setDepth(9);
+    this.ghostLabel = this.world(
+      this.add
+        .text(x, y - 24, '', { fontFamily: 'monospace', fontSize: '12px', color: '#ff2a6d', backgroundColor: '#050814' })
+        .setOrigin(0.5)
+        .setDepth(9),
+    );
 
-    this.msg.setText(`CIBERPSICOPATA DETECTADO [${ROLE_LABEL[role]}]`);
-    this.time.delayedCall(2500, () => {
-      if (this.state === 'wave') this.msg.setText('');
-    });
+    this.showBanner(`CIBERPSICOPATA DETECTADO [${ROLE_LABEL[role]}]`, '#ff2a6d', 2200);
+    sfx.ghost();
   }
 
   private clearGhostVisuals() {
@@ -358,6 +527,7 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
+  // ---------- inimigos ----------
   private pickEnemyType(): EnemyType {
     const r = Math.random();
     if (this.wave >= 3 && r < 0.15) return 'tank';
@@ -365,45 +535,103 @@ export class GameScene extends Phaser.Scene {
     return 'normal';
   }
 
+  // ponto na borda da arena, longe do jogador
+  private edgePoint(minDist: number, margin = 0): { x: number; y: number } {
+    let x = 0;
+    let y = 0;
+    for (let i = 0; i < 8; i++) {
+      const side = Phaser.Math.Between(0, 3);
+      x = side === 0 ? margin : side === 1 ? W - margin : Phaser.Math.Between(margin, W - margin);
+      y = side === 2 ? margin : side === 3 ? H - margin : Phaser.Math.Between(margin, H - margin);
+      if (Phaser.Math.Distance.Between(x, y, this.player.x, this.player.y) >= minDist) break;
+    }
+    return { x, y };
+  }
+
+  // inimigo recém-nascido aparece "fantasma" e não causa dano até ficar sólido
+  private armEnemy(e: Phaser.Physics.Arcade.Sprite, ms: number) {
+    e.setData('armedAt', this.time.now + ms);
+    e.setAlpha(0.3);
+    this.tweens.add({ targets: e, alpha: 1, duration: ms });
+  }
+
   private spawn() {
     if (this.state !== 'wave') return;
-    const side = Phaser.Math.Between(0, 3);
-    const x = side === 0 ? 0 : side === 1 ? 960 : Phaser.Math.Between(0, 960);
-    const y = side === 2 ? 0 : side === 3 ? 540 : Phaser.Math.Between(0, 540);
+    const { x, y } = this.edgePoint(SPAWN_MIN_DIST);
     const type = this.pickEnemyType();
     const t = ENEMY[type];
-    const e = this.enemies.create(x, y, t.tex) as Phaser.Physics.Arcade.Sprite;
+    const e = this.world(this.enemies.create(x, y, t.tex) as Phaser.Physics.Arcade.Sprite);
     e.setData('hp', Math.max(1, 1 + Math.floor(this.wave / 2) + t.hp));
     e.setData('mul', t.mul);
     e.setData('dmg', t.dmg + (type === 'tank' ? this.wave * 2 : this.wave));
     e.setData('reward', t.reward);
+    e.setData('fx', type);
+    this.armEnemy(e, SPAWN_TELEGRAPH);
   }
 
   private hitEnemy(b: Phaser.GameObjects.GameObject, e: Phaser.GameObjects.GameObject) {
+    if (!b.active || !e.active) return; // duas balas no mesmo frame não podem matar duas vezes
+    const spr = e as Phaser.Physics.Arcade.Sprite;
     b.destroy();
     const hp = (e.getData('hp') as number) - this.stats.damage;
-    if (hp <= 0) {
-      this.stats.edinhos += e.getData('reward') as number;
-      if (e.getData('isGhost')) {
-        this.ghostDefeated = true;
-        this.clearGhostVisuals();
-      }
-      e.destroy();
-    } else e.setData('hp', hp);
+    const fx = e.getData('fx') as FxKey;
+    const isGhost = Boolean(e.getData('isGhost'));
+
+    if (hp > 0) {
+      e.setData('hp', hp);
+      spr.setTintFill(0xffffff);
+      this.time.delayedCall(60, () => spr.active && spr.clearTint());
+      if (isGhost) this.floatText(spr.x, spr.y - 22, String(this.stats.damage), '#ffffff', 11);
+      sfx.hit();
+      return;
+    }
+
+    const reward = e.getData('reward') as number;
+    this.stats.edinhos += reward;
+    if (isGhost) {
+      this.ghostDefeated = true;
+      this.clearGhostVisuals();
+      this.burst('ghost', spr.x, spr.y, 40);
+      this.cameras.main.shake(260, 0.012);
+      this.cameras.main.zoomTo(1.05, 80);
+      this.time.delayedCall(90, () => this.cameras.main.zoomTo(1, 180));
+      this.floatText(spr.x, spr.y - 20, `+${reward}`, '#05d9e8', 16);
+      this.showBanner('FANTASMA ELIMINADO', '#05d9e8', 1600);
+      sfx.ghostDown();
+    } else {
+      this.burst(fx, spr.x, spr.y, fx === 'tank' ? 12 : 6);
+      if (reward >= 10) this.floatText(spr.x, spr.y - 14, `+${reward}`, '#05d9e8', 12);
+      sfx.kill(fx === 'tank');
+    }
+    e.destroy();
   }
 
   private hurtPlayer(e: Phaser.GameObjects.GameObject) {
-    if (this.time.now < this.iframeUntil || this.state !== 'wave') return;
-    this.iframeUntil = this.time.now + 500;
-    this.stats.hp -= e.getData('dmg') as number;
-    if (this.stats.hp <= 0) this.finish('Você morreu na rua.', false);
+    const now = this.time.now;
+    if (now < this.iframeUntil || this.state !== 'wave') return;
+    if (now < ((e.getData('armedAt') as number | undefined) ?? 0)) return; // ainda está nascendo
+    const dmg = e.getData('dmg') as number;
+    this.iframeUntil = now + 500;
+    this.stats.hp -= dmg;
+    if (this.stats.hp <= 0) return this.finish('Você morreu na rua.', 'dead');
+
+    // o golpe pesa conforme o dano
+    this.cameras.main.shake(120, Phaser.Math.Clamp(dmg * 0.0007, 0.003, 0.012));
+    this.burst('player', this.player.x, this.player.y, 6);
+    this.player.setTintFill(0xff2a6d);
+    this.time.delayedCall(80, () => this.player.active && this.player.clearTint());
+    sfx.hurt();
   }
 
+  // ---------- waves e loja ----------
   private startWave(n: number) {
     this.wave = n;
     this.timeLeft = WAVE_TIME;
+    this.overtime = false;
     this.state = 'wave';
-    this.msg.setText('');
+    this.setMsg('');
+    this.showBanner(`WAVE ${n}`);
+    sfx.waveStart();
     this.scheduleGhostIfNeeded();
   }
 
@@ -411,11 +639,14 @@ export class GameScene extends Phaser.Scene {
     this.enemies.clear(true, true);
     this.bullets.clear(true, true);
     this.clearGhostVisuals();
+    this.hideBanner();
     this.player.setVelocity(0, 0);
-    if (this.wave >= TOTAL_WAVES) return this.finish(`VITÓRIA! ${TOTAL_WAVES} waves sobrevividas.`, false);
+    this.player.setAlpha(1);
+    if (this.wave >= TOTAL_WAVES) return this.finish(`VITÓRIA! ${TOTAL_WAVES} waves sobrevividas.`, 'win');
     this.rerolls = 0;
     this.rollShop();
     this.state = 'shop';
+    sfx.waveEnd();
     this.showShop();
   }
 
@@ -434,10 +665,14 @@ export class GameScene extends Phaser.Scene {
 
   private reroll() {
     const cost = this.rerollCost();
-    if (this.stats.edinhos < cost) return this.showShop('Edinhos insuficientes para reroll.');
+    if (this.stats.edinhos < cost) {
+      sfx.deny();
+      return this.showShop('Edinhos insuficientes para reroll.');
+    }
     this.stats.edinhos -= cost;
     this.rerolls++;
     this.rollShop();
+    sfx.click();
     this.showShop('Loja atualizada.');
   }
 
@@ -449,7 +684,7 @@ export class GameScene extends Phaser.Scene {
           : `[${n + 1}] --- (instalado)`,
       )
       .join('\n');
-    this.msg.setText(
+    this.setMsg(
       `LOJA (wave ${this.wave} concluída)  Implantes: ${this.implants.length}\n\n${lines}\n\n` +
         `[R] reroll (${this.rerollCost()} edinhos)   [ESPAÇO] próxima wave\n\n${note}`,
     );
@@ -459,13 +694,17 @@ export class GameScene extends Phaser.Scene {
     const imp = this.shopItems[i];
     if (!imp) return;
     const price = this.priceOf(imp);
-    if (this.stats.edinhos < price) return this.showShop('Edinhos insuficientes.');
+    if (this.stats.edinhos < price) {
+      sfx.deny();
+      return this.showShop('Edinhos insuficientes.');
+    }
     this.stats.edinhos -= price;
     this.stats.humanity -= imp.humanity;
     imp.apply(this.stats);
     this.implants.push(imp.name);
     this.shopItems[i] = null;
-    if (this.stats.humanity <= 0) return this.finish('CIBERPSICOSE. Você virou o inimigo.', true);
+    if (this.stats.humanity <= 0) return this.finish('CIBERPSICOSE. Você virou o inimigo.', 'psycho');
+    sfx.buy();
     this.showShop(`${imp.name} instalado.`);
   }
 
@@ -474,16 +713,34 @@ export class GameScene extends Phaser.Scene {
     return Math.round(s.damage * 10 + (1000 / s.fireDelay) * 10 + s.maxHp / 2 + (1 / s.enemySlow) * 20 + this.implants.length * 50 + this.wave * 100);
   }
 
-  private finish(text: string, psycho: boolean) {
+  private finish(text: string, kind: EndKind) {
     this.state = 'over';
+    this.hideBanner();
     this.clearGhostVisuals();
+    this.physics.pause();
+    this.player.setVelocity(0, 0);
+    this.player.setAlpha(1);
     const score = this.powerScore();
-    if (psycho) {
-      const ghosts = JSON.parse(localStorage.getItem('ghosts') ?? '[]');
-      ghosts.push({ score, wave: this.wave, implants: this.implants });
-      localStorage.setItem('ghosts', JSON.stringify(ghosts.slice(-20)));
+
+    let note = '';
+    if (kind === 'psycho') {
+      const saved = saveGhost({ score, wave: this.wave, implants: this.implants });
+      if (!saved) note = '\n(não foi possível salvar o fantasma neste navegador)';
+      this.cameras.main.shake(300, 0.01);
+      this.cameras.main.flash(300, 5, 217, 232);
+      sfx.psycho();
+    } else if (kind === 'dead') {
+      this.burst('player', this.player.x, this.player.y, 30);
+      this.player.setVisible(false);
+      this.cameras.main.shake(320, 0.015);
+      this.cameras.main.flash(250, 255, 42, 109);
+      sfx.death();
+    } else {
+      this.cameras.main.flash(200, 0, 240, 255);
+      sfx.win();
     }
-    this.msg.setText(`${text}\n\nPoder: ${score}\n\n[R] recomeçar`);
+
+    this.setMsg(`${text}\n\nPoder: ${score}${note}\n\n[R] recomeçar`);
   }
 
   private updateHud() {
@@ -494,9 +751,10 @@ export class GameScene extends Phaser.Scene {
       else if (this.ghostRole !== 'none') ghostHud = `   Fantasma ${this.ghost.score} (${ROLE_LABEL[this.ghostRole]} W${this.ghostWave})`;
       else ghostHud = `   Fantasma ${this.ghost.score}`;
     }
+    const time = this.overtime ? '--' : Math.max(0, Math.ceil(this.timeLeft));
     this.hud.setText(
       `HP ${Math.max(0, Math.round(s.hp))}/${s.maxHp}   Edinhos ${s.edinhos}   Humanidade ${s.humanity}   ` +
-        `Wave ${this.wave}/${TOTAL_WAVES}   Tempo ${Math.max(0, Math.ceil(this.timeLeft))}s${ghostHud}`,
+        `Wave ${this.wave}/${TOTAL_WAVES}   Tempo ${time}s${ghostHud}`,
     );
   }
 }

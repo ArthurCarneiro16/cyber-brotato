@@ -1,3 +1,4 @@
+// Estados possíveis da máquina de estados do jogo
 export type State = 'wave' | 'shop' | 'over' | 'pause' | 'build' | 'confirm_restart';
 
 export type Stats = {
