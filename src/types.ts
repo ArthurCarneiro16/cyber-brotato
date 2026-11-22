@@ -16,6 +16,7 @@ export type Ghost = {
   score: number;
   wave: number;
   implants: string[];
+  seed?: number; // seed da run que gerou este fantasma
 };
 
 export type GhostRole = 'none' | 'elite' | 'miniboss' | 'boss';
