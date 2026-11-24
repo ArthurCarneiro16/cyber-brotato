@@ -4,7 +4,19 @@ import { ENEMY } from './data/enemies';
 import { loadGhosts, saveGhost } from './storage';
 import { sfx } from './sfx';
 import { Rng, randomSeed } from './rules/rng';
-import { Run, TOTAL_WAVES, WAVE_TIME, SPAWN_INTERVAL_MS, enemySpeed, enemyStats, ghostStats } from './rules/run';
+import {
+  Run,
+  SLOWMO_COOLDOWN,
+  SLOWMO_FACTOR,
+  SLOWMO_FIRE_MUL,
+  SPAWN_INTERVAL_MS,
+  TOTAL_WAVES,
+  WAVE_TIME,
+  enemySpeed,
+  enemyStats,
+  ghostStats,
+  slowmoDuration,
+} from './rules/run';
 import type { LiveGhostRole } from './rules/run';
 
 // A cena só desenha, lê input e mostra feedback. Estado, loja, preços, fantasma e
@@ -53,6 +65,7 @@ export class GameScene extends Phaser.Scene {
   private banner!: Phaser.GameObjects.Text;
   private bannerTween: Phaser.Tweens.Tween | null = null;
   private hint!: Phaser.GameObjects.Text;
+  private slowOverlay!: Phaser.GameObjects.Rectangle;
 
   private state: State = 'wave';
   private timeLeft = WAVE_TIME;
@@ -62,6 +75,11 @@ export class GameScene extends Phaser.Scene {
   private movedOnce = false;
   private shotOnce = false;
   private hintDone = false;
+
+  // Sandevistan: timers em segundos, só correm durante a wave (congelam na pausa).
+  // A recarga só começa a contar quando a ativa termina.
+  private slowLeft = 0;
+  private slowCd = 0;
 
   private ghostSpawned = false;
   private ghostEnemy: Phaser.Physics.Arcade.Sprite | null = null;
@@ -103,6 +121,8 @@ export class GameScene extends Phaser.Scene {
     this.shotOnce = false;
     this.hintDone = false;
     this.bannerTween = null;
+    this.slowLeft = 0;
+    this.slowCd = 0;
     this.ghostSpawned = false;
     this.ghostEnemy = null;
     this.ghostLabel = null;
@@ -188,6 +208,7 @@ export class GameScene extends Phaser.Scene {
 
     // interface (câmera própria, nunca treme)
     const style = { fontFamily: 'monospace', fontSize: '14px', color: '#9ef' };
+    this.slowOverlay = this.ui(this.add.rectangle(480, 270, W, H, 0x05d9e8, 0.1).setDepth(1).setVisible(false));
     this.hud = this.ui(this.add.text(10, 8, '', style).setDepth(10));
     this.msgBg = this.ui(
       this.add.rectangle(480, 270, 10, 10, 0x05050a, 0.82).setStrokeStyle(2, 0x00f0ff, 0.6).setDepth(9).setVisible(false),
@@ -270,6 +291,20 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
+    // Sandevistan: a recarga só corre depois que a ativa termina
+    const dt = delta / 1000;
+    if (this.slowLeft > 0) {
+      this.slowLeft -= dt;
+      if (this.slowLeft <= 0) {
+        this.slowLeft = 0;
+        this.slowCd = SLOWMO_COOLDOWN;
+        this.slowOverlay.setVisible(false);
+      }
+    } else if (this.slowCd > 0) {
+      this.slowCd = Math.max(0, this.slowCd - dt);
+    }
+    if (Phaser.Input.Keyboard.JustDown(this.keys.SPACE)) this.tryActivateSlow();
+
     // i-frames visíveis: o jogador pisca enquanto está invulnerável
     const now = this.time.now;
     this.player.setAlpha(now < this.iframeUntil && Math.floor(now / 70) % 2 ? 0.25 : 1);
@@ -283,10 +318,10 @@ export class GameScene extends Phaser.Scene {
     dir.normalize().scale(this.stats.speed);
     this.player.setVelocity(dir.x, dir.y);
 
-    // tiro com mouse (segurar o botão)
+    // tiro com mouse (segurar o botão); com o Sandevistan ativo a cadência sobe
     const p = this.input.activePointer;
     if (p.isDown && time > this.nextShot) {
-      this.nextShot = time + this.stats.fireDelay;
+      this.nextShot = time + this.stats.fireDelay / (this.slowLeft > 0 ? SLOWMO_FIRE_MUL : 1);
       this.shotOnce = true;
       const angle = Phaser.Math.Angle.Between(this.player.x, this.player.y, p.worldX, p.worldY);
       const b = this.world(this.bullets.create(this.player.x, this.player.y, 'b') as Phaser.Physics.Arcade.Sprite);
@@ -301,8 +336,8 @@ export class GameScene extends Phaser.Scene {
       this.tweens.add({ targets: this.hint, alpha: 0, duration: 600 });
     }
 
-    // inimigos perseguem o jogador
-    const base = enemySpeed(this.wave, this.stats.enemySlow);
+    // inimigos perseguem o jogador (mais lentos enquanto o Sandevistan está ativo)
+    const base = enemySpeed(this.wave, this.stats.enemySlow) * (this.slowLeft > 0 ? SLOWMO_FACTOR : 1);
     this.enemies.getChildren().forEach((e) =>
       this.physics.moveToObject(e as Phaser.Physics.Arcade.Sprite, this.player, base * (e.getData('mul') as number)),
     );
@@ -328,6 +363,27 @@ export class GameScene extends Phaser.Scene {
     } else if (status === 'done') {
       this.endWave();
     }
+  }
+
+  // ---------- Sandevistan ----------
+  private tryActivateSlow() {
+    const copies = this.stats.slowmo;
+    if (copies <= 0) return;
+    if (this.slowLeft > 0) return; // já ativo
+    if (this.slowCd > 0) {
+      sfx.deny();
+      return;
+    }
+    this.slowLeft = slowmoDuration(copies);
+    this.slowOverlay.setVisible(true);
+    this.showBanner('SANDEVISTAN', '#05d9e8', 500);
+    sfx.waveStart();
+  }
+
+  private resetSlow() {
+    this.slowLeft = 0;
+    this.slowCd = 0;
+    this.slowOverlay.setVisible(false);
   }
 
   // ---------- feedback ----------
@@ -416,8 +472,9 @@ export class GameScene extends Phaser.Scene {
         `HP: ${Math.max(0, Math.round(s.hp))}/${s.maxHp}   |   Dano: ${s.damage}\n` +
         `Velocidade: ${s.speed}   |   Cadência: ${s.fireDelay}ms (${shotsPerSec} tiros/s)\n` +
         `Humanidade: ${s.humanity}   |   Edinhos: ${s.edinhos}\n` +
-        `Lentidão Inimigos: ${slowPct}% (${s.enemySlow.toFixed(2)}x)   |   Poder: ${this.run.powerScore()}\n\n` +
-        `--- IMPLANTES ADQUIRIDOS (${this.implants.length}) ---\n${implantsText}\n\n` +
+        `Lentidão Inimigos: ${slowPct}% (${s.enemySlow.toFixed(2)}x)   |   Poder: ${this.run.powerScore()}\n` +
+        (s.slowmo > 0 ? `Sandevistan: ${slowmoDuration(s.slowmo)}s ativo / ${SLOWMO_COOLDOWN}s recarga\n` : '') +
+        `\n--- IMPLANTES ADQUIRIDOS (${this.implants.length}) ---\n${implantsText}\n\n` +
         '[1] ou [ESC] Voltar ao menu de pausa',
     );
   }
@@ -573,6 +630,7 @@ export class GameScene extends Phaser.Scene {
     this.timeLeft = WAVE_TIME;
     this.overtime = false;
     this.state = 'wave';
+    this.resetSlow(); // a ativa começa pronta em toda wave
     this.setMsg('');
     this.showBanner(`WAVE ${n}`);
     sfx.waveStart();
@@ -584,6 +642,7 @@ export class GameScene extends Phaser.Scene {
     this.bullets.clear(true, true);
     this.clearGhostVisuals();
     this.hideBanner();
+    this.resetSlow();
     this.player.setVelocity(0, 0);
     this.player.setAlpha(1);
     if (this.wave >= TOTAL_WAVES) return this.finish(`VITÓRIA! ${TOTAL_WAVES} waves sobrevividas.`, 'win');
@@ -634,6 +693,7 @@ export class GameScene extends Phaser.Scene {
     this.state = 'over';
     this.hideBanner();
     this.clearGhostVisuals();
+    this.resetSlow();
     this.physics.pause();
     this.player.setVelocity(0, 0);
     this.player.setAlpha(1);
@@ -667,9 +727,15 @@ export class GameScene extends Phaser.Scene {
       ? `   Fantasma ${r.ghost.score} (eliminado)`
       : `   Fantasma ${r.ghost.score} (${ROLE_LABEL[r.ghostRole]} W${r.ghostWave}${tag})`;
     const time = this.overtime ? '--' : Math.max(0, Math.ceil(this.timeLeft));
+    const slowHud =
+      s.slowmo > 0
+        ? `\nSandevistan [ESPAÇO] ${
+            this.slowLeft > 0 ? `ATIVO ${this.slowLeft.toFixed(1)}s` : this.slowCd > 0 ? `recarga ${Math.ceil(this.slowCd)}s` : 'PRONTO'
+          }`
+        : '';
     this.hud.setText(
       `HP ${Math.max(0, Math.round(s.hp))}/${s.maxHp}   Edinhos ${s.edinhos}   Humanidade ${s.humanity}   ` +
-        `Wave ${this.wave}/${TOTAL_WAVES}   Tempo ${time}s${ghostHud}`,
+        `Wave ${this.wave}/${TOTAL_WAVES}   Tempo ${time}s${ghostHud}${slowHud}`,
     );
   }
 }

@@ -10,6 +10,36 @@ export const TOTAL_WAVES = 5; // MVP: 5 waves (depois 10 + modo infinito)
 export const WAVE_TIME = 45; // segundos (depois 60-120)
 export const SPAWN_INTERVAL_MS = 450;
 
+// cortes de pontuação do papel do fantasma (usados também pelo simulador)
+export const GHOST_CUT_MID = 600; // a partir daqui: 40% de boss
+export const GHOST_CUT_HIGH = 750; // a partir daqui: 75% de boss
+
+// Sandevistan (ativa no ESPAÇO): momento de poder, com recarga longa
+export const SLOWMO_FACTOR = 0.3; // velocidade dos inimigos enquanto ativo
+export const SLOWMO_FIRE_MUL = 1.5; // cadência do jogador enquanto ativo
+export const SLOWMO_COOLDOWN = 25; // s, contados a partir do FIM da ativa
+
+/** duração em segundos: 5s com 1 cópia, +1s por cópia extra */
+export const slowmoDuration = (copies: number) => (copies > 0 ? 4 + copies : 0);
+
+/** fração da wave com a ativa ligada (usa 1x no início e de novo assim que recarregar) */
+function slowmoUptime(copies: number): number {
+  const dur = slowmoDuration(copies);
+  if (dur <= 0) return 0;
+  const uses = Math.floor(Math.max(0, WAVE_TIME - dur) / (dur + SLOWMO_COOLDOWN)) + 1;
+  return Math.min(1, (uses * dur) / WAVE_TIME);
+}
+
+/** multiplicador médio da velocidade dos inimigos considerando o tempo ativo (simulador) */
+export function slowmoAvgFactor(copies: number): number {
+  return 1 - slowmoUptime(copies) * (1 - SLOWMO_FACTOR);
+}
+
+/** multiplicador médio da cadência do jogador considerando o tempo ativo (simulador) */
+export function slowmoAvgFire(copies: number): number {
+  return 1 + slowmoUptime(copies) * (SLOWMO_FIRE_MUL - 1);
+}
+
 export const START: Readonly<Stats> = {
   hp: 100,
   maxHp: 100,
@@ -19,6 +49,7 @@ export const START: Readonly<Stats> = {
   humanity: 100,
   edinhos: 0,
   enemySlow: 1,
+  slowmo: 0,
 };
 
 // usado até existir um fantasma real salvo (stand-in)
@@ -34,7 +65,7 @@ export type BuyResult =
 
 /** pontuação alta -> mais chance de boss final; baixa -> mais chance de mini-boss */
 export function pickGhostRole(score: number, rng: Rng): LiveGhostRole {
-  const bossChance = score >= 950 ? 0.75 : score >= 650 ? 0.4 : 0.15;
+  const bossChance = score >= GHOST_CUT_HIGH ? 0.75 : score >= GHOST_CUT_MID ? 0.4 : 0.15;
   return rng.chance(bossChance) ? 'boss' : 'miniboss';
 }
 

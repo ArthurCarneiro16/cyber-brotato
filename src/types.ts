@@ -10,6 +10,7 @@ export type Stats = {
   humanity: number;
   edinhos: number;
   enemySlow: number;
+  slowmo: number; // cópias do Sandevistan instaladas (0 = sem a ativa)
 };
 
 export type Ghost = {

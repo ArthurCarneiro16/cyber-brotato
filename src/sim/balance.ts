@@ -6,6 +6,8 @@ import { IMPLANTS } from '../data/implants';
 import type { Stats } from '../types';
 import { Rng } from '../rules/rng';
 import {
+  GHOST_CUT_HIGH,
+  GHOST_CUT_MID,
   Run,
   SPAWN_INTERVAL_MS,
   START,
@@ -14,7 +16,8 @@ import {
   enemySpeed,
   enemyStats,
   ghostStats,
-  powerScoreOf,
+  slowmoAvgFactor,
+  slowmoAvgFire,
 } from '../rules/run';
 
 // ---- premissas do modelo (ajuste aqui se o jogo real divergir) ----
@@ -72,12 +75,12 @@ function fightWave(run: Run, bot: Bot, rng: Rng): WaveOutcome {
       enemies.push({ hp: g.hp, dmg: g.dmg, mul: g.mul, reward: g.reward, dist: SPAWN_DIST, born: t + 0.35, ghost: true });
     }
 
-    // movimento
-    const base = enemySpeed(run.wave, run.stats.enemySlow);
+    // movimento (Sandevistan entra como lentidão média pelo tempo ativo)
+    const base = enemySpeed(run.wave, run.stats.enemySlow) * slowmoAvgFactor(run.stats.slowmo);
     for (const e of enemies) e.dist = Math.max(CONTACT_DIST, e.dist - base * e.mul * DT);
 
-    // tiros: cada um acerta o inimigo mais próximo
-    shotAcc += (1000 / run.stats.fireDelay) * bot.accuracy * DT;
+    // tiros: cada um acerta o inimigo mais próximo (Sandevistan entra como cadência média)
+    shotAcc += (1000 / run.stats.fireDelay) * slowmoAvgFire(run.stats.slowmo) * bot.accuracy * DT;
     while (shotAcc >= 1 && enemies.length > 0) {
       shotAcc -= 1;
       let ni = 0;
@@ -108,12 +111,14 @@ function fightWave(run: Run, bot: Bot, rng: Rng): WaveOutcome {
 
 /**
  * Valor de combate estimado de uma build: tiros/s x dano útil (dano acima da vida média do inimigo
- * é desperdício) x raiz da vida x folga de movimento x lentidão dos inimigos.
+ * é desperdício) x raiz da vida x folga de movimento x lentidão dos inimigos (passiva e Sandevistan).
  */
 function combatValue(s: Stats, wave: number): number {
   const avgEnemyHp = 1 + Math.floor(wave / 2) + 0.5;
-  const dps = (1000 / s.fireDelay) * Math.min(s.damage, avgEnemyHp);
-  return dps * Math.sqrt(s.maxHp) * Math.sqrt(s.speed / START.speed) * (1 / s.enemySlow);
+  const dps = (1000 / s.fireDelay) * slowmoAvgFire(s.slowmo) * Math.min(s.damage, avgEnemyHp);
+  return (
+    (dps * Math.sqrt(s.maxHp) * Math.sqrt(s.speed / START.speed)) / (s.enemySlow * slowmoAvgFactor(s.slowmo))
+  );
 }
 
 /** escolhe o índice da loja a comprar, ou null */
@@ -200,11 +205,11 @@ const psychos = [...byBot.values()].flat().filter((r) => r.outcome === 'psycho')
 if (psychos.length > 0) {
   const p = psychos.map((r) => r.power).sort((a, b) => a - b);
   const q = (f: number) => p[Math.min(p.length - 1, Math.floor(f * p.length))];
-  const low = p.filter((x) => x < 650).length;
-  const mid = p.filter((x) => x >= 650 && x < 950).length;
-  const high = p.filter((x) => x >= 950).length;
+  const low = p.filter((x) => x < GHOST_CUT_MID).length;
+  const mid = p.filter((x) => x >= GHOST_CUT_MID && x < GHOST_CUT_HIGH).length;
+  const high = p.filter((x) => x >= GHOST_CUT_HIGH).length;
   console.log(`\nFantasmas gerados (${psychos.length} ciberpsicoses): poder mín ${p[0]}  mediana ${q(0.5)}  máx ${p[p.length - 1]}`);
-  console.log(`  faixas de papel: <650 (15% boss): ${low}   650-949 (40% boss): ${mid}   >=950 (75% boss): ${high}`);
+  console.log(`  faixas de papel: <${GHOST_CUT_MID} (15% boss): ${low}   ${GHOST_CUT_MID}-${GHOST_CUT_HIGH - 1} (40% boss): ${mid}   >=${GHOST_CUT_HIGH} (75% boss): ${high}`);
 } else {
   console.log('\nNenhuma ciberpsicose na simulação: nenhum fantasma novo seria gerado.');
 }

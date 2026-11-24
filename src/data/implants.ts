@@ -41,11 +41,11 @@ export const IMPLANTS: Implant[] = [
   },
   {
     name: 'Sandevistan Lite',
-    desc: 'tiro 40% mais rápido',
+    desc: 'ESPAÇO: inimigos a 30% da velocidade e tiro 1,5x mais rápido por 5s (recarga 25s)',
     edinhos: 160,
     humanity: 25,
     apply: (s) => {
-      s.fireDelay = Math.max(80, s.fireDelay * 0.6);
+      s.slowmo += 1;
     },
   },
   {
@@ -61,8 +61,8 @@ export const IMPLANTS: Implant[] = [
   {
     name: 'Gorilla Arms',
     desc: '+2 de dano por tiro',
-    edinhos: 280,
-    humanity: 35,
+    edinhos: 230,
+    humanity: 30,
     apply: (s) => {
       s.damage += 2;
     },
@@ -70,8 +70,8 @@ export const IMPLANTS: Implant[] = [
   {
     name: 'Kerenzikov',
     desc: 'inimigos 30% mais lentos',
-    edinhos: 260,
-    humanity: 40,
+    edinhos: 220,
+    humanity: 30,
     apply: (s) => {
       s.enemySlow = Math.max(0.35, s.enemySlow * 0.7);
     },
