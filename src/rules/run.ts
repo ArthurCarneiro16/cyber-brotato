@@ -19,8 +19,26 @@ export const SLOWMO_FACTOR = 0.3; // velocidade dos inimigos enquanto ativo
 export const SLOWMO_FIRE_MUL = 1.5; // cadência do jogador enquanto ativo
 export const SLOWMO_COOLDOWN = 25; // s, contados a partir do FIM da ativa
 
+// Mantis Blades: corte automático em arco, na direção do mouse
+export const MANTIS_INTERVAL = 0.6; // s entre cortes
+export const MANTIS_RANGE = 64; // px
+export const MANTIS_ARC = (Math.PI * 2) / 3; // 120 graus
+
+// Gorilla Arms: tiros empurram o inimigo para longe do jogador
+export const GORILLA_PUSH_SPEED = 320; // px/s durante o empurrão
+export const GHOST_PUSH_RESIST = 0.3; // o fantasma é empurrado só 30% disso
+
 /** duração em segundos: 5s com 1 cópia, +1s por cópia extra */
 export const slowmoDuration = (copies: number) => (copies > 0 ? 4 + copies : 0);
+
+/** dano do corte do Mantis: 3 com 1 cópia, +1 por cópia extra */
+export const mantisDamage = (copies: number) => (copies > 0 ? 2 + copies : 0);
+
+/** duração do empurrão em ms: 125ms por cópia (= 40px por cópia) */
+export const gorillaPushMs = (copies: number) => copies * 125;
+
+/** distância do empurrão em px (usado no simulador) */
+export const gorillaPushDist = (copies: number) => (GORILLA_PUSH_SPEED * gorillaPushMs(copies)) / 1000;
 
 /** fração da wave com a ativa ligada (usa 1x no início e de novo assim que recarregar) */
 function slowmoUptime(copies: number): number {
@@ -49,7 +67,10 @@ export const START: Readonly<Stats> = {
   humanity: 100,
   edinhos: 0,
   enemySlow: 1,
+  dmgTaken: 1,
   slowmo: 0,
+  mantis: 0,
+  gorilla: 0,
 };
 
 // usado até existir um fantasma real salvo (stand-in)
@@ -71,7 +92,14 @@ export function pickGhostRole(score: number, rng: Rng): LiveGhostRole {
 
 export function powerScoreOf(s: Stats, implantCount: number, wave: number): number {
   return Math.round(
-    s.damage * 10 + (1000 / s.fireDelay) * 10 + s.maxHp / 2 + (1 / s.enemySlow) * 20 + implantCount * 50 + wave * 100,
+    s.damage * 10 +
+      (1000 / s.fireDelay) * 10 +
+      s.maxHp / 2 +
+      (1 / s.enemySlow) * 20 +
+      s.mantis * 10 +
+      s.gorilla * 10 +
+      implantCount * 50 +
+      wave * 100,
   );
 }
 
@@ -166,9 +194,9 @@ export class Run {
     return powerScoreOf(this.stats, this.implants.length, this.wave);
   }
 
-  /** dano no jogador; true se morreu */
+  /** dano de contato no jogador (já com a redução do Kerenzikov, mínimo 1); true se morreu */
   hurt(dmg: number): boolean {
-    this.stats.hp -= dmg;
+    this.stats.hp -= Math.max(1, Math.round(dmg * this.stats.dmgTaken));
     return this.stats.hp <= 0;
   }
 

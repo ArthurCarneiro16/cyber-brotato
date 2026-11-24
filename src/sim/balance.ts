@@ -8,6 +8,9 @@ import { Rng } from '../rules/rng';
 import {
   GHOST_CUT_HIGH,
   GHOST_CUT_MID,
+  GHOST_PUSH_RESIST,
+  MANTIS_INTERVAL,
+  MANTIS_RANGE,
   Run,
   SPAWN_INTERVAL_MS,
   START,
@@ -16,6 +19,8 @@ import {
   enemySpeed,
   enemyStats,
   ghostStats,
+  gorillaPushDist,
+  mantisDamage,
   slowmoAvgFactor,
   slowmoAvgFire,
 } from '../rules/run';
@@ -28,6 +33,9 @@ const IFRAME = 0.5; // s, igual ao jogo
 const TELEGRAPH = 0.45; // s sem dano depois de nascer, igual ao jogo
 const GHOST_DELAY = 3.5; // s depois do início da wave, igual ao jogo
 const OVERTIME_CAP = 90; // s extras no máximo para derrubar o boss
+const MANTIS_COVER = 0.6; // chance de um inimigo ao alcance estar dentro do arco do corte
+const MANTIS_VALUE = 1.0; // peso do corte no valor de compra (só vale de perto)
+const GORILLA_VALUE = 0.15; // bônus de valor por cópia (empurrão = tempo extra)
 
 type Bot = {
   name: string;
@@ -49,11 +57,22 @@ const BOTS: Bot[] = [
 type SimEnemy = { hp: number; dmg: number; mul: number; reward: number; dist: number; born: number; ghost: boolean };
 type WaveOutcome = 'ok' | 'dead' | 'timeout';
 
+/** aplica dano; true se o inimigo morreu (remove da lista, dá recompensa) */
+function dealDamage(run: Run, enemies: SimEnemy[], target: SimEnemy, dmg: number): boolean {
+  target.hp -= dmg;
+  if (target.hp > 0) return false;
+  run.stats.edinhos += target.reward;
+  if (target.ghost) run.ghostDefeated = true;
+  enemies.splice(enemies.indexOf(target), 1);
+  return true;
+}
+
 function fightWave(run: Run, bot: Bot, rng: Rng): WaveOutcome {
   const enemies: SimEnemy[] = [];
   let t = 0;
   let spawnAcc = 0;
   let shotAcc = 0;
+  let mantisAcc = MANTIS_INTERVAL; // o corte começa pronto
   let iframeUntil = -1;
   let ghostSpawned = false;
 
@@ -86,14 +105,29 @@ function fightWave(run: Run, bot: Bot, rng: Rng): WaveOutcome {
       let ni = 0;
       for (let i = 1; i < enemies.length; i++) if (enemies[i].dist < enemies[ni].dist) ni = i;
       const target = enemies[ni];
-      target.hp -= run.stats.damage;
-      if (target.hp <= 0) {
-        run.stats.edinhos += target.reward;
-        if (target.ghost) run.ghostDefeated = true;
-        enemies.splice(ni, 1);
+      const killed = dealDamage(run, enemies, target, run.stats.damage);
+      // Gorilla Arms: o tiro que não mata empurra o inimigo para longe
+      if (!killed && run.stats.gorilla > 0) {
+        const push = gorillaPushDist(run.stats.gorilla) * (target.ghost ? GHOST_PUSH_RESIST : 1);
+        target.dist = Math.min(SPAWN_DIST, target.dist + push);
       }
     }
     if (enemies.length === 0) shotAcc = Math.min(shotAcc, 1); // sem alvo, não acumula tiros
+
+    // Mantis Blades: corta quem está ao alcance e dentro do arco; sem alvo, fica pronto esperando
+    if (run.stats.mantis > 0) {
+      mantisAcc += DT;
+      if (mantisAcc >= MANTIS_INTERVAL) {
+        const near = enemies.filter((e) => e.dist <= MANTIS_RANGE && rng.chance(MANTIS_COVER));
+        if (near.length > 0) {
+          mantisAcc -= MANTIS_INTERVAL;
+          const dmg = mantisDamage(run.stats.mantis);
+          for (const e of near) dealDamage(run, enemies, e, dmg);
+        } else {
+          mantisAcc = MANTIS_INTERVAL;
+        }
+      }
+    }
 
     // contato: no máximo um golpe por janela de invulnerabilidade
     if (t >= iframeUntil) {
@@ -111,13 +145,17 @@ function fightWave(run: Run, bot: Bot, rng: Rng): WaveOutcome {
 
 /**
  * Valor de combate estimado de uma build: tiros/s x dano útil (dano acima da vida média do inimigo
- * é desperdício) x raiz da vida x folga de movimento x lentidão dos inimigos (passiva e Sandevistan).
+ * é desperdício) + corte do Mantis, x raiz da vida x folga de movimento x lentidão dos inimigos
+ * (passiva e Sandevistan) x bônus pequeno do empurrão do Gorilla, dividido pelo dano recebido
+ * (Kerenzikov funciona como vida efetiva maior).
  */
 function combatValue(s: Stats, wave: number): number {
   const avgEnemyHp = 1 + Math.floor(wave / 2) + 0.5;
-  const dps = (1000 / s.fireDelay) * slowmoAvgFire(s.slowmo) * Math.min(s.damage, avgEnemyHp);
+  const shotDps = (1000 / s.fireDelay) * slowmoAvgFire(s.slowmo) * Math.min(s.damage, avgEnemyHp);
+  const mantisDps = (1 / MANTIS_INTERVAL) * Math.min(mantisDamage(s.mantis), avgEnemyHp) * MANTIS_VALUE;
   return (
-    (dps * Math.sqrt(s.maxHp) * Math.sqrt(s.speed / START.speed)) / (s.enemySlow * slowmoAvgFactor(s.slowmo))
+    ((shotDps + mantisDps) * Math.sqrt(s.maxHp) * Math.sqrt(s.speed / START.speed) * (1 + GORILLA_VALUE * s.gorilla)) /
+    (s.enemySlow * slowmoAvgFactor(s.slowmo) * s.dmgTaken)
   );
 }
 
@@ -148,7 +186,7 @@ type RunResult = {
 
 function simulate(seed: number, bot: Bot): RunResult {
   const run = new Run(seed, []);
-  const rng = new Rng(seed ^ 0x1234abcd); // sorteios do bot (esquiva)
+  const rng = new Rng(seed ^ 0x1234abcd); // sorteios do bot (esquiva e cobertura do corte)
   const done = (outcome: RunResult['outcome']): RunResult => ({
     outcome,
     wave: run.wave,

@@ -5,6 +5,11 @@ import { loadGhosts, saveGhost } from './storage';
 import { sfx } from './sfx';
 import { Rng, randomSeed } from './rules/rng';
 import {
+  GHOST_PUSH_RESIST,
+  GORILLA_PUSH_SPEED,
+  MANTIS_ARC,
+  MANTIS_INTERVAL,
+  MANTIS_RANGE,
   Run,
   SLOWMO_COOLDOWN,
   SLOWMO_FACTOR,
@@ -15,6 +20,8 @@ import {
   enemySpeed,
   enemyStats,
   ghostStats,
+  gorillaPushMs,
+  mantisDamage,
   slowmoDuration,
 } from './rules/run';
 import type { LiveGhostRole } from './rules/run';
@@ -81,6 +88,9 @@ export class GameScene extends Phaser.Scene {
   private slowLeft = 0;
   private slowCd = 0;
 
+  // Mantis Blades: tempo (s) até o próximo corte automático
+  private slashCd = 0;
+
   private ghostSpawned = false;
   private ghostEnemy: Phaser.Physics.Arcade.Sprite | null = null;
   private ghostLabel: Phaser.GameObjects.Text | null = null;
@@ -123,6 +133,7 @@ export class GameScene extends Phaser.Scene {
     this.bannerTween = null;
     this.slowLeft = 0;
     this.slowCd = 0;
+    this.slashCd = 0;
     this.ghostSpawned = false;
     this.ghostEnemy = null;
     this.ghostLabel = null;
@@ -330,17 +341,27 @@ export class GameScene extends Phaser.Scene {
       sfx.shoot();
     }
 
+    // Mantis Blades: corte automático em arco
+    this.updateSlash(dt);
+
     // a dica de controles some quando o jogador já fez as duas coisas
     if (!this.hintDone && this.movedOnce && this.shotOnce) {
       this.hintDone = true;
       this.tweens.add({ targets: this.hint, alpha: 0, duration: 600 });
     }
 
-    // inimigos perseguem o jogador (mais lentos enquanto o Sandevistan está ativo)
+    // inimigos perseguem o jogador (mais lentos com o Sandevistan); quem foi empurrado pelo
+    // Gorilla Arms se afasta por um instante em vez de perseguir
     const base = enemySpeed(this.wave, this.stats.enemySlow) * (this.slowLeft > 0 ? SLOWMO_FACTOR : 1);
-    this.enemies.getChildren().forEach((e) =>
-      this.physics.moveToObject(e as Phaser.Physics.Arcade.Sprite, this.player, base * (e.getData('mul') as number)),
-    );
+    this.enemies.getChildren().forEach((e) => {
+      const spr = e as Phaser.Physics.Arcade.Sprite;
+      if (now < ((spr.getData('pushUntil') as number | undefined) ?? 0)) {
+        const away = Phaser.Math.Angle.Between(this.player.x, this.player.y, spr.x, spr.y);
+        this.physics.velocityFromRotation(away, GORILLA_PUSH_SPEED, spr.body!.velocity);
+      } else {
+        this.physics.moveToObject(spr, this.player, base * (spr.getData('mul') as number));
+      }
+    });
 
     // atualiza rótulo do fantasma ativo
     if (this.ghostEnemy?.active && this.ghostLabel) {
@@ -384,6 +405,39 @@ export class GameScene extends Phaser.Scene {
     this.slowLeft = 0;
     this.slowCd = 0;
     this.slowOverlay.setVisible(false);
+  }
+
+  // ---------- Mantis Blades ----------
+  // Corta sozinho a cada MANTIS_INTERVAL, mas só quando há inimigo dentro do arco
+  // (na direção do mouse); sem alvo, o corte fica pronto esperando.
+  private updateSlash(dt: number) {
+    if (this.stats.mantis <= 0) return;
+    this.slashCd = Math.max(0, this.slashCd - dt);
+    if (this.slashCd > 0) return;
+
+    const px = this.player.x;
+    const py = this.player.y;
+    const p = this.input.activePointer;
+    const aim = Phaser.Math.Angle.Between(px, py, p.worldX, p.worldY);
+
+    const targets = (this.enemies.getChildren() as Phaser.Physics.Arcade.Sprite[]).filter((e) => {
+      if (!e.active) return false;
+      if (Phaser.Math.Distance.Between(px, py, e.x, e.y) > MANTIS_RANGE + e.displayWidth / 2) return false;
+      const off = Phaser.Math.Angle.Wrap(Phaser.Math.Angle.Between(px, py, e.x, e.y) - aim);
+      return Math.abs(off) <= MANTIS_ARC / 2;
+    });
+    if (targets.length === 0) return;
+
+    this.slashCd = MANTIS_INTERVAL;
+    const dmg = mantisDamage(this.stats.mantis);
+    targets.forEach((t) => t.active && this.damageEnemy(t, dmg));
+
+    // leque ciano que some rápido
+    const gfx = this.world(this.add.graphics().setDepth(15));
+    gfx.fillStyle(0x00f0ff, 0.55);
+    gfx.slice(px, py, MANTIS_RANGE, aim - MANTIS_ARC / 2, aim + MANTIS_ARC / 2, false);
+    gfx.fillPath();
+    this.tweens.add({ targets: gfx, alpha: 0, duration: 140, onComplete: () => gfx.destroy() });
   }
 
   // ---------- feedback ----------
@@ -474,6 +528,8 @@ export class GameScene extends Phaser.Scene {
         `Humanidade: ${s.humanity}   |   Edinhos: ${s.edinhos}\n` +
         `Lentidão Inimigos: ${slowPct}% (${s.enemySlow.toFixed(2)}x)   |   Poder: ${this.run.powerScore()}\n` +
         (s.slowmo > 0 ? `Sandevistan: ${slowmoDuration(s.slowmo)}s ativo / ${SLOWMO_COOLDOWN}s recarga\n` : '') +
+        (s.mantis > 0 ? `Mantis Blades: corte de ${mantisDamage(s.mantis)} de dano a cada ${MANTIS_INTERVAL}s\n` : '') +
+        (s.gorilla > 0 ? `Gorilla Arms: empurrão de ${s.gorilla * 40}px por tiro\n` : '') +
         `\n--- IMPLANTES ADQUIRIDOS (${this.implants.length}) ---\n${implantsText}\n\n` +
         '[1] ou [ESC] Voltar ao menu de pausa',
     );
@@ -571,24 +627,22 @@ export class GameScene extends Phaser.Scene {
     this.armEnemy(e, SPAWN_TELEGRAPH);
   }
 
-  private hitEnemy(b: Phaser.GameObjects.GameObject, e: Phaser.GameObjects.GameObject) {
-    if (!b.active || !e.active) return; // duas balas no mesmo frame não podem matar duas vezes
-    const spr = e as Phaser.Physics.Arcade.Sprite;
-    b.destroy();
-    const hp = (e.getData('hp') as number) - this.stats.damage;
-    const fx = e.getData('fx') as FxKey;
-    const isGhost = Boolean(e.getData('isGhost'));
+  // dano em um inimigo (tiro ou corte); true se ele morreu
+  private damageEnemy(spr: Phaser.Physics.Arcade.Sprite, dmg: number): boolean {
+    const hp = (spr.getData('hp') as number) - dmg;
+    const fx = spr.getData('fx') as FxKey;
+    const isGhost = Boolean(spr.getData('isGhost'));
 
     if (hp > 0) {
-      e.setData('hp', hp);
+      spr.setData('hp', hp);
       spr.setTintFill(0xffffff);
       this.time.delayedCall(60, () => spr.active && spr.clearTint());
-      if (isGhost) this.floatText(spr.x, spr.y - 22, String(this.stats.damage), '#ffffff', 11);
+      if (isGhost) this.floatText(spr.x, spr.y - 22, String(dmg), '#ffffff', 11);
       sfx.hit();
-      return;
+      return false;
     }
 
-    const reward = e.getData('reward') as number;
+    const reward = spr.getData('reward') as number;
     this.stats.edinhos += reward;
     if (isGhost) {
       this.run.ghostDefeated = true;
@@ -605,7 +659,23 @@ export class GameScene extends Phaser.Scene {
       if (reward >= 10) this.floatText(spr.x, spr.y - 14, `+${reward}`, '#05d9e8', 12);
       sfx.kill(fx === 'tank');
     }
-    e.destroy();
+    spr.destroy();
+    return true;
+  }
+
+  // Gorilla Arms: o tiro que não mata empurra o inimigo (o fantasma resiste)
+  private pushEnemy(spr: Phaser.Physics.Arcade.Sprite) {
+    const copies = this.stats.gorilla;
+    if (copies <= 0) return;
+    const resist = spr.getData('isGhost') ? GHOST_PUSH_RESIST : 1;
+    spr.setData('pushUntil', this.time.now + gorillaPushMs(copies) * resist);
+  }
+
+  private hitEnemy(b: Phaser.GameObjects.GameObject, e: Phaser.GameObjects.GameObject) {
+    if (!b.active || !e.active) return; // duas balas no mesmo frame não podem matar duas vezes
+    const spr = e as Phaser.Physics.Arcade.Sprite;
+    b.destroy();
+    if (!this.damageEnemy(spr, this.stats.damage)) this.pushEnemy(spr);
   }
 
   private hurtPlayer(e: Phaser.GameObjects.GameObject) {
@@ -631,6 +701,7 @@ export class GameScene extends Phaser.Scene {
     this.overtime = false;
     this.state = 'wave';
     this.resetSlow(); // a ativa começa pronta em toda wave
+    this.slashCd = 0;
     this.setMsg('');
     this.showBanner(`WAVE ${n}`);
     sfx.waveStart();

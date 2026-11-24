@@ -10,7 +10,10 @@ export type Stats = {
   humanity: number;
   edinhos: number;
   enemySlow: number;
+  dmgTaken: number; // multiplicador do dano de contato recebido (1 = normal, menor = mais defesa)
   slowmo: number; // cópias do Sandevistan instaladas (0 = sem a ativa)
+  mantis: number; // cópias do Mantis Blades (0 = sem o corte automático)
+  gorilla: number; // cópias do Gorilla Arms (0 = tiros sem empurrão)
 };
 
 export type Ghost = {

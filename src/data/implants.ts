@@ -32,11 +32,11 @@ export const IMPLANTS: Implant[] = [
   },
   {
     name: 'Mantis Blades',
-    desc: '+1 de dano por tiro',
+    desc: 'corta em arco sozinho (64px, a cada 0,6s). Dano 3, +1 por cópia',
     edinhos: 200,
     humanity: 20,
     apply: (s) => {
-      s.damage += 1;
+      s.mantis += 1;
     },
   },
   {
@@ -60,20 +60,22 @@ export const IMPLANTS: Implant[] = [
   },
   {
     name: 'Gorilla Arms',
-    desc: '+2 de dano por tiro',
-    edinhos: 230,
-    humanity: 30,
+    desc: '+1 de dano e os tiros empurram os inimigos',
+    edinhos: 200,
+    humanity: 25,
     apply: (s) => {
-      s.damage += 2;
+      s.damage += 1;
+      s.gorilla += 1;
     },
   },
   {
     name: 'Kerenzikov',
-    desc: 'inimigos 30% mais lentos',
+    desc: 'inimigos 30% mais lentos e dano de contato -15%',
     edinhos: 220,
     humanity: 30,
     apply: (s) => {
       s.enemySlow = Math.max(0.35, s.enemySlow * 0.7);
+      s.dmgTaken = Math.max(0.5, s.dmgTaken * 0.85);
     },
   },
 ];
