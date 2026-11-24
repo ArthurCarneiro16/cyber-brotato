@@ -6,27 +6,64 @@ import { IMPLANTS } from '../data/implants';
 import { ENEMY } from '../data/enemies';
 import { Rng } from './rng';
 
+// =====================================================================
+// CONSTANTES
+// =====================================================================
+
+// ---------- waves ----------
 export const TOTAL_WAVES = 5; // MVP: 5 waves (depois 10 + modo infinito)
 export const WAVE_TIME = 45; // segundos (depois 60-120)
 export const SPAWN_INTERVAL_MS = 450;
 
-// cortes de pontuação do papel do fantasma (usados também pelo simulador)
+// ---------- fantasma: cortes de pontuação do papel (usados também pelo simulador) ----------
 export const GHOST_CUT_MID = 600; // a partir daqui: 40% de boss
 export const GHOST_CUT_HIGH = 750; // a partir daqui: 75% de boss
+export const GHOST_PUSH_RESIST = 0.3; // o fantasma é empurrado só 30% do Gorilla Arms
 
-// Sandevistan (ativa no ESPAÇO): momento de poder, com recarga longa
+// ---------- Sandevistan (ativa no ESPAÇO): momento de poder, com recarga longa ----------
 export const SLOWMO_FACTOR = 0.3; // velocidade dos inimigos enquanto ativo
 export const SLOWMO_FIRE_MUL = 1.5; // cadência do jogador enquanto ativo
 export const SLOWMO_COOLDOWN = 25; // s, contados a partir do FIM da ativa
 
-// Mantis Blades: corte automático em arco, na direção do mouse
+// ---------- Mantis Blades: corte automático em arco, na direção do mouse ----------
 export const MANTIS_INTERVAL = 0.6; // s entre cortes
 export const MANTIS_RANGE = 64; // px
 export const MANTIS_ARC = (Math.PI * 2) / 3; // 120 graus
 
-// Gorilla Arms: tiros empurram o inimigo para longe do jogador
+// ---------- Gorilla Arms: tiros empurram o inimigo para longe do jogador ----------
 export const GORILLA_PUSH_SPEED = 320; // px/s durante o empurrão
-export const GHOST_PUSH_RESIST = 0.3; // o fantasma é empurrado só 30% disso
+
+export const START: Readonly<Stats> = {
+  hp: 100,
+  maxHp: 100,
+  speed: 200,
+  fireDelay: 300,
+  damage: 1,
+  humanity: 100,
+  edinhos: 0,
+  enemySlow: 1,
+  dmgTaken: 1,
+  slowmo: 0,
+  mantis: 0,
+  gorilla: 0,
+};
+
+// usado até existir um fantasma real salvo (stand-in)
+export const FALLBACK_GHOST: Ghost = { score: 700, wave: 3, implants: ['Mantis Blades', 'Subdermal Armor'] };
+
+// =====================================================================
+// TIPOS
+// =====================================================================
+
+export type LiveGhostRole = 'miniboss' | 'boss';
+export type WaveStatus = 'running' | 'overtime' | 'done';
+export type BuyResult =
+  | { ok: false; reason: 'empty' | 'poor' }
+  | { ok: true; implant: Implant; price: number; psycho: boolean };
+
+// =====================================================================
+// FUNÇÕES PURAS: implantes
+// =====================================================================
 
 /** duração em segundos: 5s com 1 cópia, +1s por cópia extra */
 export const slowmoDuration = (copies: number) => (copies > 0 ? 4 + copies : 0);
@@ -58,37 +95,9 @@ export function slowmoAvgFire(copies: number): number {
   return 1 + slowmoUptime(copies) * (SLOWMO_FIRE_MUL - 1);
 }
 
-export const START: Readonly<Stats> = {
-  hp: 100,
-  maxHp: 100,
-  speed: 200,
-  fireDelay: 300,
-  damage: 1,
-  humanity: 100,
-  edinhos: 0,
-  enemySlow: 1,
-  dmgTaken: 1,
-  slowmo: 0,
-  mantis: 0,
-  gorilla: 0,
-};
-
-// usado até existir um fantasma real salvo (stand-in)
-export const FALLBACK_GHOST: Ghost = { score: 700, wave: 3, implants: ['Mantis Blades', 'Subdermal Armor'] };
-
-export type LiveGhostRole = 'miniboss' | 'boss';
-export type WaveStatus = 'running' | 'overtime' | 'done';
-export type BuyResult =
-  | { ok: false; reason: 'empty' | 'poor' }
-  | { ok: true; implant: Implant; price: number; psycho: boolean };
-
-// ---------- funções puras ----------
-
-/** pontuação alta -> mais chance de boss final; baixa -> mais chance de mini-boss */
-export function pickGhostRole(score: number, rng: Rng): LiveGhostRole {
-  const bossChance = score >= GHOST_CUT_HIGH ? 0.75 : score >= GHOST_CUT_MID ? 0.4 : 0.15;
-  return rng.chance(bossChance) ? 'boss' : 'miniboss';
-}
+// =====================================================================
+// FUNÇÕES PURAS: pontuação, inimigos e fantasma
+// =====================================================================
 
 export function powerScoreOf(s: Stats, implantCount: number, wave: number): number {
   return Math.round(
@@ -114,6 +123,12 @@ export function enemyStats(type: EnemyType, wave: number) {
 }
 
 export const enemySpeed = (wave: number, slow: number) => (55 + wave * 10) * slow;
+
+/** pontuação alta -> mais chance de boss final; baixa -> mais chance de mini-boss */
+export function pickGhostRole(score: number, rng: Rng): LiveGhostRole {
+  const bossChance = score >= GHOST_CUT_HIGH ? 0.75 : score >= GHOST_CUT_MID ? 0.4 : 0.15;
+  return rng.chance(bossChance) ? 'boss' : 'miniboss';
+}
 
 /** escala o fantasma pela pontuação salva e pela wave em que aparece */
 export function ghostStats(ghost: Ghost, role: LiveGhostRole, wave: number) {
@@ -141,7 +156,74 @@ export function ghostStats(ghost: Ghost, role: LiveGhostRole, wave: number) {
   };
 }
 
-// ---------- estado da run ----------
+// =====================================================================
+// COMPORTAMENTO DOS INIMIGOS: aviso -> investida -> recuperação
+// Usado pela cena e pelo simulador, para os dois andarem iguais.
+// =====================================================================
+
+export type Phase = 'chase' | 'windup' | 'dash' | 'recover';
+export type Behavior = { phase: Phase; t: number }; // t = segundos na fase atual
+
+type BehaviorConfig = {
+  trigger: number; // px: só começa o aviso a esta distância do jogador
+  chaseMin: number; // s perseguindo antes de poder avisar de novo
+  windup: number; // s parado, avisando
+  dash: number; // s de investida
+  dashMul: number; // velocidade da investida (multiplica a velocidade normal do inimigo)
+  recover: number; // s de recuperação
+  recoverMul: number; // velocidade na recuperação (0 = parado)
+  dashDmg: number; // multiplicador do dano de contato durante a investida
+};
+
+export const BEHAVIOR: Partial<Record<EnemyType, BehaviorConfig>> = {
+  fast: { trigger: 280, chaseMin: 0.4, windup: 0.4, dash: 0.35, dashMul: 3, recover: 0.6, recoverMul: 0.3, dashDmg: 1.0 },
+  tank: { trigger: 360, chaseMin: 1.0, windup: 0.8, dash: 0.6, dashMul: 5, recover: 1.0, recoverMul: 0, dashDmg: 1.25 },
+};
+
+export const newBehavior = (): Behavior => ({ phase: 'chase', t: 0 });
+
+/** avança a máquina de fases e devolve o multiplicador de velocidade do instante */
+export function stepBehavior(type: EnemyType, b: Behavior, dist: number, dt: number): number {
+  const c = BEHAVIOR[type];
+  if (!c) return 1;
+  b.t += dt;
+  switch (b.phase) {
+    case 'chase':
+      if (b.t >= c.chaseMin && dist <= c.trigger) {
+        b.phase = 'windup';
+        b.t = 0;
+      }
+      return 1;
+    case 'windup':
+      if (b.t >= c.windup) {
+        b.phase = 'dash';
+        b.t = 0;
+      }
+      return 0;
+    case 'dash':
+      if (b.t >= c.dash) {
+        b.phase = 'recover';
+        b.t = 0;
+      }
+      return c.dashMul;
+    case 'recover':
+      if (b.t >= c.recover) {
+        b.phase = 'chase';
+        b.t = 0;
+      }
+      return c.recoverMul;
+  }
+}
+
+/** dano de contato fica maior durante a investida */
+export function behaviorDmgMul(type: EnemyType | null | undefined, b: Behavior): number {
+  const c = type ? BEHAVIOR[type] : undefined;
+  return c && b.phase === 'dash' ? c.dashDmg : 1;
+}
+
+// =====================================================================
+// ESTADO DA RUN
+// =====================================================================
 
 export class Run {
   readonly seed: number;

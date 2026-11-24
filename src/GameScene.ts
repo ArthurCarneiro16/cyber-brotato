@@ -5,6 +5,7 @@ import { loadGhosts, saveGhost } from './storage';
 import { sfx } from './sfx';
 import { Rng, randomSeed } from './rules/rng';
 import {
+  BEHAVIOR,
   GHOST_PUSH_RESIST,
   GORILLA_PUSH_SPEED,
   MANTIS_ARC,
@@ -17,17 +18,24 @@ import {
   SPAWN_INTERVAL_MS,
   TOTAL_WAVES,
   WAVE_TIME,
+  behaviorDmgMul,
   enemySpeed,
   enemyStats,
   ghostStats,
   gorillaPushMs,
   mantisDamage,
+  newBehavior,
   slowmoDuration,
+  stepBehavior,
 } from './rules/run';
-import type { LiveGhostRole } from './rules/run';
+import type { Behavior, LiveGhostRole } from './rules/run';
 
 // A cena só desenha, lê input e mostra feedback. Estado, loja, preços, fantasma e
 // sorteios vivem em ./rules/run.ts (sem Phaser, testado em tests/run.test.ts).
+
+// =====================================================================
+// CONSTANTES
+// =====================================================================
 
 const BUY_KEYS = ['ONE', 'TWO', 'THREE'];
 
@@ -47,12 +55,22 @@ const FX_COLOR: Record<FxKey, number> = {
   player: 0x00f0ff,
 };
 
+// cor do piscar de aviso de cada inimigo com investida
+const TELEGRAPH_COLOR: Record<EnemyType, number> = {
+  normal: 0xffffff,
+  fast: 0xff9e00,
+  tank: 0xb14aed,
+};
+
 const W = 960;
 const H = 540;
 const SPAWN_MIN_DIST = 220; // inimigos não nascem em cima do jogador
 const SPAWN_TELEGRAPH = 450; // ms "fantasma" antes de poder causar dano
 
 export class GameScene extends Phaser.Scene {
+  // =====================================================================
+  // CAMPOS
+  // =====================================================================
   private run!: Run;
 
   private player!: Phaser.Physics.Arcade.Sprite;
@@ -110,7 +128,9 @@ export class GameScene extends Phaser.Scene {
     return this.run.wave;
   }
 
-  // ---------- helpers de camada ----------
+  // =====================================================================
+  // CAMADAS
+  // =====================================================================
   private world<T extends Phaser.GameObjects.GameObject>(o: T): T {
     this.worldLayer.add(o);
     return o;
@@ -121,6 +141,9 @@ export class GameScene extends Phaser.Scene {
     return o;
   }
 
+  // =====================================================================
+  // CREATE
+  // =====================================================================
   create() {
     this.state = 'wave';
     this.timeLeft = WAVE_TIME;
@@ -139,8 +162,13 @@ export class GameScene extends Phaser.Scene {
     this.ghostLabel = null;
 
     // seed da run: ?seed=123 na URL repete a mesma run (loja, fantasma, spawns)
-    const urlSeed = Number(new URLSearchParams(window.location.search).get('seed'));
+    const params = new URLSearchParams(window.location.search);
+    const urlSeed = Number(params.get('seed'));
     this.run = new Run(urlSeed > 0 ? urlSeed : randomSeed(), loadGhosts());
+
+    // ?wave=3 na URL começa direto naquela wave (para testar)
+    const startWave = Number(params.get('wave'));
+    if (startWave >= 1 && startWave <= TOTAL_WAVES) this.run.wave = startWave;
 
     this.physics.resume();
     this.time.paused = false;
@@ -151,49 +179,8 @@ export class GameScene extends Phaser.Scene {
     this.cameras.main.ignore(this.uiLayer);
     this.uiCam.ignore(this.worldLayer);
 
-    // placeholders: quadrados coloridos (troca por pixel art depois)
-    const g = this.add.graphics();
-    const tex = (key: string, color: number, size: number) => {
-      if (this.textures.exists(key)) return;
-      g.clear();
-      g.fillStyle(color);
-      g.fillRect(0, 0, size, size);
-      g.generateTexture(key, size, size);
-    };
-    tex('p', 0x00f0ff, 16);
-    tex('e', 0xff2a6d, 14);
-    tex('ef', 0xff9e00, 10);
-    tex('et', 0xb14aed, 24);
-    tex('b', 0xf5e642, 6);
-    tex('w', 0xffffff, 4); // partículas (recebem tint)
-    if (!this.textures.exists('eg')) {
-      g.clear();
-      g.fillStyle(0x05d9e8);
-      g.fillRect(0, 0, 24, 24);
-      g.fillStyle(0xff2a6d);
-      g.fillRect(4, 4, 16, 16);
-      g.generateTexture('eg', 24, 24);
-    }
-    g.destroy();
-
-    const mkFx = (color: number) =>
-      this.world(
-        this.add.particles(0, 0, 'w', {
-          speed: { min: 50, max: 190 },
-          lifespan: { min: 220, max: 480 },
-          scale: { start: 1.6, end: 0 },
-          alpha: { start: 1, end: 0 },
-          tint: color,
-          emitting: false,
-        }),
-      );
-    this.fx = {
-      normal: mkFx(FX_COLOR.normal),
-      fast: mkFx(FX_COLOR.fast),
-      tank: mkFx(FX_COLOR.tank),
-      ghost: mkFx(FX_COLOR.ghost),
-      player: mkFx(FX_COLOR.player),
-    };
+    this.createTextures();
+    this.createFx();
 
     this.player = this.world(this.physics.add.sprite(480, 270, 'p').setCollideWorldBounds(true));
     this.bullets = this.physics.add.group();
@@ -217,7 +204,63 @@ export class GameScene extends Phaser.Scene {
     this.game.events.on(Phaser.Core.Events.BLUR, onBlur);
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => this.game.events.off(Phaser.Core.Events.BLUR, onBlur));
 
-    // interface (câmera própria, nunca treme)
+    this.createUi();
+
+    this.showBanner(`WAVE ${this.wave}`);
+    sfx.waveStart();
+    this.scheduleGhostIfNeeded();
+  }
+
+  // placeholders: quadrados coloridos (troca por pixel art depois)
+  private createTextures() {
+    const g = this.add.graphics();
+    const tex = (key: string, color: number, size: number) => {
+      if (this.textures.exists(key)) return;
+      g.clear();
+      g.fillStyle(color);
+      g.fillRect(0, 0, size, size);
+      g.generateTexture(key, size, size);
+    };
+    tex('p', 0x00f0ff, 16);
+    tex('e', 0xff2a6d, 14);
+    tex('ef', 0xff9e00, 10);
+    tex('et', 0xb14aed, 24);
+    tex('b', 0xf5e642, 6);
+    tex('w', 0xffffff, 4); // partículas (recebem tint)
+    if (!this.textures.exists('eg')) {
+      g.clear();
+      g.fillStyle(0x05d9e8);
+      g.fillRect(0, 0, 24, 24);
+      g.fillStyle(0xff2a6d);
+      g.fillRect(4, 4, 16, 16);
+      g.generateTexture('eg', 24, 24);
+    }
+    g.destroy();
+  }
+
+  private createFx() {
+    const mkFx = (color: number) =>
+      this.world(
+        this.add.particles(0, 0, 'w', {
+          speed: { min: 50, max: 190 },
+          lifespan: { min: 220, max: 480 },
+          scale: { start: 1.6, end: 0 },
+          alpha: { start: 1, end: 0 },
+          tint: color,
+          emitting: false,
+        }),
+      );
+    this.fx = {
+      normal: mkFx(FX_COLOR.normal),
+      fast: mkFx(FX_COLOR.fast),
+      tank: mkFx(FX_COLOR.tank),
+      ghost: mkFx(FX_COLOR.ghost),
+      player: mkFx(FX_COLOR.player),
+    };
+  }
+
+  // interface (câmera própria, nunca treme)
+  private createUi() {
     const style = { fontFamily: 'monospace', fontSize: '14px', color: '#9ef' };
     this.slowOverlay = this.ui(this.add.rectangle(480, 270, W, H, 0x05d9e8, 0.1).setDepth(1).setVisible(false));
     this.hud = this.ui(this.add.text(10, 8, '', style).setDepth(10));
@@ -241,12 +284,11 @@ export class GameScene extends Phaser.Scene {
     this.ui(
       this.add.text(10, H - 6, `seed ${this.run.seed}`, { ...style, fontSize: '11px', color: '#4a5a6e' }).setOrigin(0, 1).setDepth(10),
     );
-
-    this.showBanner('WAVE 1');
-    sfx.waveStart();
-    this.scheduleGhostIfNeeded();
   }
 
+  // =====================================================================
+  // UPDATE
+  // =====================================================================
   update(time: number, delta: number) {
     this.updateHud();
 
@@ -297,13 +339,32 @@ export class GameScene extends Phaser.Scene {
       return;
     }
 
+    // ---- estado 'wave' ----
     if (Phaser.Input.Keyboard.JustDown(this.keys.ESC)) {
       this.openPauseMenu();
       return;
     }
 
-    // Sandevistan: a recarga só corre depois que a ativa termina
     const dt = delta / 1000;
+    const now = this.time.now;
+
+    this.updateSandevistan(dt);
+    this.updatePlayer(time);
+    this.updateSlash(dt);
+
+    // a dica de controles some quando o jogador já fez as duas coisas
+    if (!this.hintDone && this.movedOnce && this.shotOnce) {
+      this.hintDone = true;
+      this.tweens.add({ targets: this.hint, alpha: 0, duration: 600 });
+    }
+
+    this.updateEnemies(dt, now);
+    this.updateGhostLabel();
+    this.updateWaveTimer(delta);
+  }
+
+  // Sandevistan: a recarga só corre depois que a ativa termina
+  private updateSandevistan(dt: number) {
     if (this.slowLeft > 0) {
       this.slowLeft -= dt;
       if (this.slowLeft <= 0) {
@@ -315,7 +376,9 @@ export class GameScene extends Phaser.Scene {
       this.slowCd = Math.max(0, this.slowCd - dt);
     }
     if (Phaser.Input.Keyboard.JustDown(this.keys.SPACE)) this.tryActivateSlow();
+  }
 
+  private updatePlayer(time: number) {
     // i-frames visíveis: o jogador pisca enquanto está invulnerável
     const now = this.time.now;
     this.player.setAlpha(now < this.iframeUntil && Math.floor(now / 70) % 2 ? 0.25 : 1);
@@ -340,30 +403,63 @@ export class GameScene extends Phaser.Scene {
       this.time.delayedCall(900, () => b.active && b.destroy());
       sfx.shoot();
     }
+  }
 
-    // Mantis Blades: corte automático em arco
-    this.updateSlash(dt);
-
-    // a dica de controles some quando o jogador já fez as duas coisas
-    if (!this.hintDone && this.movedOnce && this.shotOnce) {
-      this.hintDone = true;
-      this.tweens.add({ targets: this.hint, alpha: 0, duration: 600 });
-    }
-
-    // inimigos perseguem o jogador (mais lentos com o Sandevistan); quem foi empurrado pelo
-    // Gorilla Arms se afasta por um instante em vez de perseguir
-    const base = enemySpeed(this.wave, this.stats.enemySlow) * (this.slowLeft > 0 ? SLOWMO_FACTOR : 1);
+  // inimigos perseguem o jogador (mais lentos com o Sandevistan); quem foi empurrado pelo
+  // Gorilla Arms se afasta por um instante; fast e tank seguem a máquina aviso -> investida
+  private updateEnemies(dt: number, now: number) {
+    const slow = this.slowLeft > 0 ? SLOWMO_FACTOR : 1;
+    const base = enemySpeed(this.wave, this.stats.enemySlow) * slow;
     this.enemies.getChildren().forEach((e) => {
       const spr = e as Phaser.Physics.Arcade.Sprite;
+      const speed = base * (spr.getData('mul') as number);
+      const type = spr.getData('type') as EnemyType | undefined;
       if (now < ((spr.getData('pushUntil') as number | undefined) ?? 0)) {
         const away = Phaser.Math.Angle.Between(this.player.x, this.player.y, spr.x, spr.y);
         this.physics.velocityFromRotation(away, GORILLA_PUSH_SPEED, spr.body!.velocity);
+      } else if (type && BEHAVIOR[type]) {
+        this.moveWithBehavior(spr, type, speed, dt * slow, now);
       } else {
-        this.physics.moveToObject(spr, this.player, base * (spr.getData('mul') as number));
+        this.physics.moveToObject(spr, this.player, speed);
       }
     });
+  }
 
-    // atualiza rótulo do fantasma ativo
+  // fast e tank: persegue -> aviso (parado, piscando) -> investida em linha reta -> recuperação
+  private moveWithBehavior(spr: Phaser.Physics.Arcade.Sprite, type: EnemyType, speed: number, dt: number, now: number) {
+    const cfg = BEHAVIOR[type]!;
+    const beh = spr.getData('beh') as Behavior;
+    const prev = beh.phase;
+    const dist = Phaser.Math.Distance.Between(spr.x, spr.y, this.player.x, this.player.y);
+    const m = stepBehavior(type, beh, dist, dt);
+
+    if (beh.phase !== prev) {
+      if (beh.phase === 'dash') {
+        // a direção trava aqui: quem se mexeu durante o aviso desvia
+        spr.setData('heading', Phaser.Math.Angle.Between(spr.x, spr.y, this.player.x, this.player.y));
+        spr.clearTint();
+      } else if (beh.phase === 'recover' || beh.phase === 'chase') {
+        spr.clearTint();
+        spr.setScale(1);
+      }
+    }
+
+    if (beh.phase === 'windup') {
+      const k = beh.t / cfg.windup; // 0 -> 1: pisca cada vez mais rápido
+      spr.setTintFill(Math.floor(now / (110 - 70 * k)) % 2 ? 0xffffff : TELEGRAPH_COLOR[type]);
+      if (type === 'tank') spr.setScale(1 + 0.3 * k);
+    }
+
+    if (m === 0) {
+      spr.setVelocity(0, 0);
+    } else if (beh.phase === 'dash') {
+      this.physics.velocityFromRotation(spr.getData('heading') as number, speed * m, spr.body!.velocity);
+    } else {
+      this.physics.moveToObject(spr, this.player, speed * m);
+    }
+  }
+
+  private updateGhostLabel() {
     if (this.ghostEnemy?.active && this.ghostLabel) {
       const hp = this.ghostEnemy.getData('hp') as number;
       const maxHp = this.ghostEnemy.getData('maxHp') as number;
@@ -371,8 +467,10 @@ export class GameScene extends Phaser.Scene {
         .setPosition(this.ghostEnemy.x, this.ghostEnemy.y - 24)
         .setText(`FANTASMA [${ROLE_LABEL[this.run.ghostRole]}] ${hp}/${maxHp}`);
     }
+  }
 
-    // fim da wave: na wave do boss o tempo não basta, é preciso derrotar o fantasma
+  // fim da wave: na wave do boss o tempo não basta, é preciso derrotar o fantasma
+  private updateWaveTimer(delta: number) {
     this.timeLeft -= delta / 1000;
     const status = this.run.waveStatus(this.timeLeft);
     if (status === 'overtime') {
@@ -386,7 +484,9 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
-  // ---------- Sandevistan ----------
+  // =====================================================================
+  // IMPLANTES: Sandevistan e Mantis Blades
+  // =====================================================================
   private tryActivateSlow() {
     const copies = this.stats.slowmo;
     if (copies <= 0) return;
@@ -407,7 +507,6 @@ export class GameScene extends Phaser.Scene {
     this.slowOverlay.setVisible(false);
   }
 
-  // ---------- Mantis Blades ----------
   // Corta sozinho a cada MANTIS_INTERVAL, mas só quando há inimigo dentro do arco
   // (na direção do mouse); sem alvo, o corte fica pronto esperando.
   private updateSlash(dt: number) {
@@ -440,7 +539,9 @@ export class GameScene extends Phaser.Scene {
     this.tweens.add({ targets: gfx, alpha: 0, duration: 140, onComplete: () => gfx.destroy() });
   }
 
-  // ---------- feedback ----------
+  // =====================================================================
+  // FEEDBACK
+  // =====================================================================
   private burst(key: FxKey, x: number, y: number, count: number) {
     this.fx[key].emitParticleAt(x, y, count);
   }
@@ -481,7 +582,29 @@ export class GameScene extends Phaser.Scene {
     this.msgBg.setSize(this.msg.width + 48, this.msg.height + 36).setVisible(true);
   }
 
-  // ---------- menus ----------
+  private updateHud() {
+    const s = this.stats;
+    const r = this.run;
+    const tag = r.usesFallbackGhost ? ' modelo' : '';
+    const ghostHud = r.ghostDefeated
+      ? `   Fantasma ${r.ghost.score} (eliminado)`
+      : `   Fantasma ${r.ghost.score} (${ROLE_LABEL[r.ghostRole]} W${r.ghostWave}${tag})`;
+    const time = this.overtime ? '--' : Math.max(0, Math.ceil(this.timeLeft));
+    const slowHud =
+      s.slowmo > 0
+        ? `\nSandevistan [ESPAÇO] ${
+            this.slowLeft > 0 ? `ATIVO ${this.slowLeft.toFixed(1)}s` : this.slowCd > 0 ? `recarga ${Math.ceil(this.slowCd)}s` : 'PRONTO'
+          }`
+        : '';
+    this.hud.setText(
+      `HP ${Math.max(0, Math.round(s.hp))}/${s.maxHp}   Edinhos ${s.edinhos}   Humanidade ${s.humanity}   ` +
+        `Wave ${this.wave}/${TOTAL_WAVES}   Tempo ${time}s${ghostHud}${slowHud}`,
+    );
+  }
+
+  // =====================================================================
+  // MENUS
+  // =====================================================================
   private openPauseMenu() {
     this.state = 'pause';
     this.physics.pause();
@@ -510,6 +633,7 @@ export class GameScene extends Phaser.Scene {
     const s = this.stats;
     const shotsPerSec = (1000 / s.fireDelay).toFixed(1);
     const slowPct = Math.round((1 - s.enemySlow) * 100);
+    const takenPct = Math.round(s.dmgTaken * 100);
 
     const implantCounts: Record<string, number> = {};
     for (const name of this.implants) {
@@ -526,7 +650,8 @@ export class GameScene extends Phaser.Scene {
         `HP: ${Math.max(0, Math.round(s.hp))}/${s.maxHp}   |   Dano: ${s.damage}\n` +
         `Velocidade: ${s.speed}   |   Cadência: ${s.fireDelay}ms (${shotsPerSec} tiros/s)\n` +
         `Humanidade: ${s.humanity}   |   Edinhos: ${s.edinhos}\n` +
-        `Lentidão Inimigos: ${slowPct}% (${s.enemySlow.toFixed(2)}x)   |   Poder: ${this.run.powerScore()}\n` +
+        `Lentidão Inimigos: ${slowPct}% (${s.enemySlow.toFixed(2)}x)   |   Dano recebido: ${takenPct}%\n` +
+        `Poder: ${this.run.powerScore()}\n` +
         (s.slowmo > 0 ? `Sandevistan: ${slowmoDuration(s.slowmo)}s ativo / ${SLOWMO_COOLDOWN}s recarga\n` : '') +
         (s.mantis > 0 ? `Mantis Blades: corte de ${mantisDamage(s.mantis)} de dano a cada ${MANTIS_INTERVAL}s\n` : '') +
         (s.gorilla > 0 ? `Gorilla Arms: empurrão de ${s.gorilla * 40}px por tiro\n` : '') +
@@ -547,7 +672,9 @@ export class GameScene extends Phaser.Scene {
     );
   }
 
-  // ---------- fantasma ----------
+  // =====================================================================
+  // FANTASMA
+  // =====================================================================
   private scheduleGhostIfNeeded() {
     if (this.ghostSpawned || this.run.ghostWave !== this.wave) return;
     this.ghostSpawned = true;
@@ -592,7 +719,10 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
-  // ---------- inimigos ----------
+  // =====================================================================
+  // INIMIGOS: spawn, dano e empurrão
+  // =====================================================================
+
   // ponto na borda da arena, longe do jogador (sorteio sempre pelo Rng da run)
   private edgePoint(minDist: number, margin = 0, rng: Rng = this.run.rng.spawn): { x: number; y: number } {
     let x = 0;
@@ -624,6 +754,8 @@ export class GameScene extends Phaser.Scene {
     e.setData('dmg', s.dmg);
     e.setData('reward', s.reward);
     e.setData('fx', type);
+    e.setData('type', type);
+    e.setData('beh', newBehavior());
     this.armEnemy(e, SPAWN_TELEGRAPH);
   }
 
@@ -682,7 +814,8 @@ export class GameScene extends Phaser.Scene {
     const now = this.time.now;
     if (now < this.iframeUntil || this.state !== 'wave') return;
     if (now < ((e.getData('armedAt') as number | undefined) ?? 0)) return; // ainda está nascendo
-    const dmg = e.getData('dmg') as number;
+    const beh = e.getData('beh') as Behavior | undefined;
+    const dmg = (e.getData('dmg') as number) * (beh ? behaviorDmgMul(e.getData('type') as EnemyType | undefined, beh) : 1);
     this.iframeUntil = now + 500;
     if (this.run.hurt(dmg)) return this.finish('Você morreu na rua.', 'dead');
 
@@ -694,7 +827,9 @@ export class GameScene extends Phaser.Scene {
     sfx.hurt();
   }
 
-  // ---------- waves e loja ----------
+  // =====================================================================
+  // WAVES E LOJA
+  // =====================================================================
   private startWave(n: number) {
     this.run.wave = n;
     this.timeLeft = WAVE_TIME;
@@ -760,6 +895,9 @@ export class GameScene extends Phaser.Scene {
     this.showShop(`${res.implant.name} instalado.`);
   }
 
+  // =====================================================================
+  // FIM DE RUN
+  // =====================================================================
   private finish(text: string, kind: EndKind) {
     this.state = 'over';
     this.hideBanner();
@@ -788,26 +926,6 @@ export class GameScene extends Phaser.Scene {
     }
 
     this.setMsg(`${text}\n\nPoder: ${score}   Seed: ${this.run.seed}${note}\n\n[R] recomeçar`);
-  }
-
-  private updateHud() {
-    const s = this.stats;
-    const r = this.run;
-    const tag = r.usesFallbackGhost ? ' modelo' : '';
-    const ghostHud = r.ghostDefeated
-      ? `   Fantasma ${r.ghost.score} (eliminado)`
-      : `   Fantasma ${r.ghost.score} (${ROLE_LABEL[r.ghostRole]} W${r.ghostWave}${tag})`;
-    const time = this.overtime ? '--' : Math.max(0, Math.ceil(this.timeLeft));
-    const slowHud =
-      s.slowmo > 0
-        ? `\nSandevistan [ESPAÇO] ${
-            this.slowLeft > 0 ? `ATIVO ${this.slowLeft.toFixed(1)}s` : this.slowCd > 0 ? `recarga ${Math.ceil(this.slowCd)}s` : 'PRONTO'
-          }`
-        : '';
-    this.hud.setText(
-      `HP ${Math.max(0, Math.round(s.hp))}/${s.maxHp}   Edinhos ${s.edinhos}   Humanidade ${s.humanity}   ` +
-        `Wave ${this.wave}/${TOTAL_WAVES}   Tempo ${time}s${ghostHud}${slowHud}`,
-    );
   }
 }
 

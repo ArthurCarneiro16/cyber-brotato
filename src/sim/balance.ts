@@ -3,7 +3,7 @@
 // Serve para comparar builds e achar quebras. Os números absolutos dependem das
 // premissas abaixo, então leia como "mais forte / mais fraco", não como verdade.
 import { IMPLANTS } from '../data/implants';
-import type { Stats } from '../types';
+import type { EnemyType, Stats } from '../types';
 import { Rng } from '../rules/rng';
 import {
   GHOST_CUT_HIGH,
@@ -16,13 +16,17 @@ import {
   START,
   TOTAL_WAVES,
   WAVE_TIME,
+  type Behavior,
+  behaviorDmgMul,
   enemySpeed,
   enemyStats,
   ghostStats,
   gorillaPushDist,
   mantisDamage,
+  newBehavior,
   slowmoAvgFactor,
   slowmoAvgFire,
+  stepBehavior,
 } from '../rules/run';
 
 // ---- premissas do modelo (ajuste aqui se o jogo real divergir) ----
@@ -54,7 +58,17 @@ const BOTS: Bot[] = [
   { name: 'descuidado', accuracy: 0.8, dodge: 0.5, humanityFloor: null, pick: 'expensive' },
 ];
 
-type SimEnemy = { hp: number; dmg: number; mul: number; reward: number; dist: number; born: number; ghost: boolean };
+type SimEnemy = {
+  hp: number;
+  dmg: number;
+  mul: number;
+  reward: number;
+  dist: number;
+  born: number;
+  ghost: boolean;
+  type: EnemyType | null;
+  beh: Behavior;
+};
 type WaveOutcome = 'ok' | 'dead' | 'timeout';
 
 /** aplica dano; true se o inimigo morreu (remove da lista, dá recompensa) */
@@ -86,17 +100,21 @@ function fightWave(run: Run, bot: Bot, rng: Rng): WaveOutcome {
       spawnAcc -= SPAWN_INTERVAL_MS;
       const type = run.pickEnemyType();
       const s = enemyStats(type, run.wave);
-      enemies.push({ hp: s.hp, dmg: s.dmg, mul: s.mul, reward: s.reward, dist: SPAWN_DIST, born: t, ghost: false });
+      enemies.push({ hp: s.hp, dmg: s.dmg, mul: s.mul, reward: s.reward, dist: SPAWN_DIST, born: t, ghost: false, type, beh: newBehavior() });
     }
     if (!ghostSpawned && run.ghostWave === run.wave && t >= GHOST_DELAY) {
       ghostSpawned = true;
       const g = ghostStats(run.ghost, run.ghostRole, run.wave);
-      enemies.push({ hp: g.hp, dmg: g.dmg, mul: g.mul, reward: g.reward, dist: SPAWN_DIST, born: t + 0.35, ghost: true });
+      enemies.push({ hp: g.hp, dmg: g.dmg, mul: g.mul, reward: g.reward, dist: SPAWN_DIST, born: t + 0.35, ghost: true, type: null, beh: newBehavior() });
     }
 
     // movimento (Sandevistan entra como lentidão média pelo tempo ativo)
     const base = enemySpeed(run.wave, run.stats.enemySlow) * slowmoAvgFactor(run.stats.slowmo);
-    for (const e of enemies) e.dist = Math.max(CONTACT_DIST, e.dist - base * e.mul * DT);
+    const timeScale = slowmoAvgFactor(run.stats.slowmo); // o Sandevistan também desacelera os timers
+    for (const e of enemies) {
+      const m = e.type ? stepBehavior(e.type, e.beh, e.dist, DT * timeScale) : 1;
+      e.dist = Math.max(CONTACT_DIST, e.dist - base * e.mul * m * DT);
+    }
 
     // tiros: cada um acerta o inimigo mais próximo (Sandevistan entra como cadência média)
     shotAcc += (1000 / run.stats.fireDelay) * slowmoAvgFire(run.stats.slowmo) * bot.accuracy * DT;
@@ -136,7 +154,7 @@ function fightWave(run: Run, bot: Bot, rng: Rng): WaveOutcome {
         iframeUntil = t + IFRAME;
         // mais velocidade de movimento = mais fácil fugir (200 px/s é a base)
         const dodge = 1 - (1 - bot.dodge) * (START.speed / run.stats.speed);
-        if (!rng.chance(dodge) && run.hurt(hitter.dmg)) return 'dead';
+        if (!rng.chance(dodge) && run.hurt(hitter.dmg * behaviorDmgMul(hitter.type, hitter.beh))) return 'dead';
       }
     }
     t += DT;
