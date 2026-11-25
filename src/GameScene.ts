@@ -1,6 +1,8 @@
 import Phaser from 'phaser';
-import type { EnemyType, State } from './types';
+import type { EnemyType, State, Weapon, WeaponId, ClassId } from './types';
 import { ENEMY } from './data/enemies';
+import { WEAPONS } from './data/weapons';
+import { CLASS_LIST, applyClassToWeapon } from './data/classes';
 import { loadGhosts, saveGhost } from './storage';
 import { sfx } from './sfx';
 import { CSS, PAL } from './palette';
@@ -22,6 +24,7 @@ import {
   SLOWMO_FACTOR,
   SLOWMO_FIRE_MUL,
   SPAWN_INTERVAL_MS,
+  START,
   TOTAL_WAVES,
   WAVE_TIME,
   behaviorDmgMul,
@@ -47,6 +50,27 @@ import type { Behavior, GhostKind, LiveGhostRole } from './rules/run';
 // =====================================================================
 
 const BUY_KEYS = ['ONE', 'TWO', 'THREE'];
+const WEAPON_KEYS = ['FOUR', 'FIVE'];
+
+const KIND_LABEL: Record<Weapon['kind'], string> = {
+  gun: 'tiro',
+  smart: 'mira auto',
+  melee: 'corpo a corpo',
+};
+
+// cor do projétil / golpe de cada arma (a pistola usa o sprite original, sem tint)
+const WEAPON_COLOR: Record<WeaponId, number> = {
+  pistol: PAL.white,
+  smg: PAL.cyan,
+  shotgun: PAL.orange,
+  smart: PAL.teal,
+  katana: PAL.cyan,
+  gorilla: PAL.pink,
+};
+
+const MIN_WEAPON_DELAY = 60; // ms, piso de cadência mesmo com implantes
+
+const fmt = (n: number) => String(Math.round(n * 10) / 10);
 
 const ROLE_LABEL: Record<LiveGhostRole, string> = {
   miniboss: 'MINI-BOSS',
@@ -73,6 +97,8 @@ const TELEGRAPH_COLOR: Record<EnemyType, number> = {
 
 const W = 960;
 const H = 540;
+// Ponto central do punho no frame original do Edgerunner (32 x 48 px).
+const PLAYER_HAND_POINT = { x: 23.5, y: 29 };
 const GRID = 32; // grade do chão da arena
 const SPAWN_MIN_DIST = 220; // inimigos não nascem em cima do jogador
 const SPAWN_TELEGRAPH = 450; // ms "fantasma" antes de poder causar dano
@@ -84,6 +110,9 @@ export class GameScene extends Phaser.Scene {
   private run!: Run;
 
   private player!: Phaser.Physics.Arcade.Sprite;
+  private playerVisual: Phaser.GameObjects.Image | null = null;
+  private katanaVisual: Phaser.GameObjects.Image | null = null;
+  private katanaAngle = 0;
   private bullets!: Phaser.Physics.Arcade.Group;
   private enemies!: Phaser.Physics.Arcade.Group;
   private keys!: Record<string, Phaser.Input.Keyboard.Key>;
@@ -102,7 +131,7 @@ export class GameScene extends Phaser.Scene {
   private hint!: Phaser.GameObjects.Text;
   private slowOverlay!: Phaser.GameObjects.Rectangle;
 
-  private state: State = 'wave';
+  private state: State = 'select';
   private timeLeft = WAVE_TIME;
   private overtime = false;
   private nextShot = 0;
@@ -154,10 +183,21 @@ export class GameScene extends Phaser.Scene {
   }
 
   // =====================================================================
+  // PRELOAD
+  // =====================================================================
+  preload() {
+    this.load.image('player-base', '/assets/characters/edgerunner/player-base.png');
+    this.load.image('katana-art', '/assets/characters/edgerunner/katana.png');
+  }
+
+  // =====================================================================
   // CREATE
   // =====================================================================
   create() {
-    this.state = 'wave';
+    this.playerVisual = null;
+    this.katanaVisual = null;
+    this.katanaAngle = 0;
+    this.state = 'select';
     this.timeLeft = WAVE_TIME;
     this.overtime = false;
     this.nextShot = 0;
@@ -196,10 +236,24 @@ export class GameScene extends Phaser.Scene {
     this.createBackground();
     this.createFx();
 
-    this.player = this.world(this.physics.add.sprite(480, 270, 'p').setCollideWorldBounds(true));
+    this.player = this.prepareActor(this.physics.add.sprite(480, 270, 'p')).setCollideWorldBounds(true);
+    if (this.textures.exists('player-base')) {
+      this.playerVisual = this.world(
+        this.add.image(this.player.x, this.player.y, 'player-base').setOrigin(0.5, 1).setScale(0.75),
+      );
+      this.playerVisual.setDepth(this.player.y);
+      this.player.setVisible(false); // mantém o Arcade Sprite ativo como objeto lógico e físico
+    }
+    this.katanaVisual = this.world(
+      this.add
+        .image(this.player.x, this.player.y, this.textures.exists('katana-art') ? 'katana-art' : 'katana')
+        .setOrigin(0.14, 0.5) // origem no centro da empunhadura do asset
+        .setScale(0.9)
+        .setVisible(false),
+    );
     this.bullets = this.physics.add.group();
     this.enemies = this.physics.add.group();
-    this.keys = this.input.keyboard!.addKeys('W,A,S,D,ONE,TWO,THREE,SPACE,R,ESC,M') as Record<
+    this.keys = this.input.keyboard!.addKeys('W,A,S,D,ONE,TWO,THREE,FOUR,FIVE,SPACE,R,ESC,M,Q') as Record<
       string,
       Phaser.Input.Keyboard.Key
     >;
@@ -220,9 +274,9 @@ export class GameScene extends Phaser.Scene {
 
     this.createUi();
 
-    this.showBanner(`WAVE ${this.wave}`);
-    sfx.waveStart();
-    this.scheduleGhostIfNeeded();
+    // a run só começa depois de escolher a classe
+    this.physics.pause();
+    this.openClassMenu();
   }
 
   // chão da arena: grade sutil atrás de tudo
@@ -272,7 +326,7 @@ export class GameScene extends Phaser.Scene {
     );
     this.hint = this.ui(
       this.add
-        .text(480, 520, 'WASD mover  ·  mouse mira e atira  ·  ESC pausa  ·  M som', {
+        .text(480, 520, 'WASD mover  ·  mouse mira e atira  ·  Q troca arma  ·  ESC pausa  ·  M som', {
           ...style,
           fontSize: '13px',
           color: CSS.textDim,
@@ -298,6 +352,15 @@ export class GameScene extends Phaser.Scene {
       this.showBanner(sfx.toggleMute() ? 'SOM LIGADO' : 'SOM DESLIGADO', CSS.text, 900);
     }
 
+    if (this.state === 'select') {
+      for (let i = 0; i < CLASS_LIST.length; i++) {
+        if (Phaser.Input.Keyboard.JustDown(this.keys[BUY_KEYS[i]])) {
+          this.beginRun(CLASS_LIST[i].id);
+          break;
+        }
+      }
+      return;
+    }
     if (this.state === 'over') {
       if (Phaser.Input.Keyboard.JustDown(this.keys.R)) this.scene.restart();
       return;
@@ -336,6 +399,9 @@ export class GameScene extends Phaser.Scene {
       BUY_KEYS.forEach((k, i) => {
         if (Phaser.Input.Keyboard.JustDown(this.keys[k])) this.buy(i);
       });
+      WEAPON_KEYS.forEach((k, i) => {
+        if (Phaser.Input.Keyboard.JustDown(this.keys[k])) this.buyWeapon(i);
+      });
       if (Phaser.Input.Keyboard.JustDown(this.keys.R)) this.reroll();
       if (Phaser.Input.Keyboard.JustDown(this.keys.SPACE)) this.startWave(this.wave + 1);
       return;
@@ -361,6 +427,7 @@ export class GameScene extends Phaser.Scene {
     }
 
     this.updateEnemies(dt, now);
+    this.updateActorDepths();
     this.updateGhostLabel();
     this.updateWaveTimer(delta);
   }
@@ -378,6 +445,58 @@ export class GameScene extends Phaser.Scene {
       this.slowCd = Math.max(0, this.slowCd - dt);
     }
     if (Phaser.Input.Keyboard.JustDown(this.keys.SPACE)) this.tryActivateSlow();
+  }
+
+  // A coordenada lógica do personagem é o ponto dos pés. A sombra usa uma
+  // textura pequena e mantém profundidade imediatamente abaixo do personagem.
+  private prepareActor(sprite: Phaser.Physics.Arcade.Sprite, scale = 1) {
+    sprite.setOrigin(0.5, 1).setScale(scale);
+    const shadow = this.world(this.add.image(sprite.x, sprite.y + 1, 'sh').setOrigin(0.5).setAlpha(0.45));
+    shadow.setScale(scale);
+    sprite.setData('shadow', shadow);
+    sprite.setDepth(sprite.y);
+    shadow.setDepth(sprite.y - 0.01);
+    return this.world(sprite);
+  }
+
+  // Só jogador e inimigos participam do y-sorting; projéteis, efeitos e HUD
+  // mantêm suas profundidades próprias.
+  private updateActorDepths() {
+    const actors = [this.player, ...this.enemies.getChildren()] as Phaser.GameObjects.GameObject[];
+    for (const object of actors) {
+      const actor = object as Phaser.Physics.Arcade.Sprite;
+      if (!actor.active) continue;
+      const shadow = actor.getData('shadow') as Phaser.GameObjects.Image | undefined;
+      actor.setDepth(actor.y);
+      if (shadow?.active) {
+        shadow.setPosition(actor.x, actor.y + 1).setDepth(actor.y - 0.01);
+      }
+    }
+    if (this.playerVisual?.active) {
+      this.playerVisual
+        .setPosition(this.player.x, this.player.y)
+        .setDepth(this.player.y)
+        .setAlpha(this.player.alpha);
+    }
+    if (this.katanaVisual?.active) {
+      const visual = this.playerVisual;
+      const handX = visual
+        ? visual.x + (PLAYER_HAND_POINT.x - visual.width * visual.originX) * visual.scaleX
+        : this.player.x + this.player.displayWidth * 0.25;
+      const handY = visual
+        ? visual.y + (PLAYER_HAND_POINT.y - visual.height * visual.originY) * visual.scaleY
+        : this.player.y - this.player.displayHeight * 0.52;
+      const aimX = Math.cos(this.katanaAngle);
+      const aimY = Math.sin(this.katanaAngle);
+      // O fio aponta para frente quando desce ou para a direita; para cima/esquerda,
+      // o corpo cobre a lâmina na sobreposição com a silhueta.
+      const katanaInFront = aimY > 0.05 || (Math.abs(aimY) <= 0.05 && aimX > 0);
+      const handDepth = katanaInFront ? 0.005 : -0.005;
+      this.katanaVisual
+        .setPosition(handX, handY)
+        .setRotation(this.katanaAngle)
+        .setDepth(this.player.y + handDepth);
+    }
   }
 
   private updatePlayer(time: number) {
@@ -398,18 +517,159 @@ export class GameScene extends Phaser.Scene {
       this.player.setVelocity(dir.x, dir.y);
     }
 
-    // tiro com mouse (segurar o botão); com o Sandevistan ativo a cadência sobe
-    const p = this.input.activePointer;
-    if (p.isDown && time > this.nextShot) {
-      this.nextShot = time + this.stats.fireDelay / (this.slowLeft > 0 ? SLOWMO_FIRE_MUL : 1);
-      this.shotOnce = true;
-      const angle = Phaser.Math.Angle.Between(this.player.x, this.player.y, p.worldX, p.worldY);
-      const b = this.world(this.bullets.create(this.player.x, this.player.y, 'b') as Phaser.Physics.Arcade.Sprite);
-      b.setRotation(angle);
-      this.physics.velocityFromRotation(angle, 520, b.body!.velocity);
-      this.time.delayedCall(900, () => b.active && b.destroy());
-      sfx.shoot();
+    // troca de arma
+    if (Phaser.Input.Keyboard.JustDown(this.keys.Q) && this.run.cycleWeapon()) {
+      this.nextShot = time + 150;
+      this.showBanner(this.weapon().name.toUpperCase(), CSS.text, 700);
+      sfx.click();
     }
+
+    // ataque com a arma equipada (corpo a corpo é automático; as de tiro seguram o botão)
+    const w = this.weapon();
+    this.katanaVisual?.setVisible(w.id === 'katana');
+    if (w.kind === 'melee') {
+      this.tryMelee(w, time);
+    } else if (this.input.activePointer.isDown && time > this.nextShot) {
+      this.fire(w, time);
+    }
+    this.updateHoming();
+  }
+
+  // =====================================================================
+  // ARMAS
+  // =====================================================================
+
+  // arma equipada já com o bônus da classe
+  private weapon(): Weapon {
+    return applyClassToWeapon(this.run.classId, WEAPONS[this.run.weaponId]);
+  }
+
+  // dano por acerto: base da arma + bônus (parcial) dos implantes
+  private weaponDamage(w: Weapon): number {
+    return w.damage + (this.stats.damage - START.damage) * w.bonusMul;
+  }
+
+  // intervalo entre ataques: base da arma escalada pelos implantes de cadência e pelo Sandevistan
+  private weaponDelay(w: Weapon): number {
+    const scaled = w.delay * (this.stats.fireDelay / START.fireDelay);
+    return Math.max(MIN_WEAPON_DELAY, scaled / (this.slowLeft > 0 ? SLOWMO_FIRE_MUL : 1));
+  }
+
+  // inimigo mais próximo; com useBody a distância desconta o raio do corpo (golpes corpo a corpo)
+  private nearestEnemy(x: number, y: number, maxDist: number, useBody = false): Phaser.Physics.Arcade.Sprite | null {
+    let best: Phaser.Physics.Arcade.Sprite | null = null;
+    let bestDist = maxDist;
+    for (const o of this.enemies.getChildren()) {
+      const e = o as Phaser.Physics.Arcade.Sprite;
+      if (!e.active) continue;
+      const d = Phaser.Math.Distance.Between(x, y, e.x, e.y) - (useBody ? e.displayWidth / 2 : 0);
+      if (d <= bestDist) {
+        bestDist = d;
+        best = e;
+      }
+    }
+    return best;
+  }
+
+  private spawnBullet(angle: number, w: Weapon, dmg: number, target: Phaser.Physics.Arcade.Sprite | null) {
+    const b = this.world(this.bullets.create(this.player.x, this.player.y, 'b') as Phaser.Physics.Arcade.Sprite);
+    b.setRotation(angle);
+    if (w.id !== 'pistol') b.setTint(WEAPON_COLOR[w.id]);
+    b.setData('dmg', dmg);
+    if (w.kind === 'smart') {
+      b.setData('homing', true);
+      b.setData('target', target);
+      b.setData('speed', w.projSpeed);
+    }
+    this.physics.velocityFromRotation(angle, w.projSpeed, b.body!.velocity);
+    this.time.delayedCall(w.life, () => b.active && b.destroy());
+  }
+
+  private fire(w: Weapon, time: number) {
+    const dmg = this.weaponDamage(w);
+    let angle: number;
+    let target: Phaser.Physics.Arcade.Sprite | null = null;
+
+    if (w.kind === 'smart') {
+      // a arma inteligente escolhe o alvo; sem inimigo no alcance, não gasta o tiro
+      target = this.nearestEnemy(this.player.x, this.player.y, w.acquire);
+      if (!target) return;
+      angle = Phaser.Math.Angle.Between(this.player.x, this.player.y, target.x, target.y);
+    } else {
+      const p = this.input.activePointer;
+      angle = Phaser.Math.Angle.Between(this.player.x, this.player.y, p.worldX, p.worldY);
+    }
+
+    this.nextShot = time + this.weaponDelay(w);
+    this.shotOnce = true;
+
+    const spread = Phaser.Math.DegToRad(w.spread);
+    for (let i = 0; i < w.pellets; i++) {
+      // vários projéteis: leque uniforme; um só: pequena imprecisão (SMG)
+      const off =
+        w.pellets > 1
+          ? -spread / 2 + (spread * i) / (w.pellets - 1)
+          : Phaser.Math.FloatBetween(-spread / 2, spread / 2);
+      this.spawnBullet(angle + off, w, dmg, target);
+    }
+    sfx.shoot();
+  }
+
+  // projéteis da pistola inteligente curvam em direção ao alvo
+  private updateHoming() {
+    this.bullets.getChildren().forEach((o) => {
+      const b = o as Phaser.Physics.Arcade.Sprite;
+      if (!b.active || !b.getData('homing')) return;
+      let t = b.getData('target') as Phaser.Physics.Arcade.Sprite | null;
+      if (!t || !t.active) {
+        t = this.nearestEnemy(b.x, b.y, 220);
+        b.setData('target', t);
+      }
+      if (t) {
+        const body = b.body as Phaser.Physics.Arcade.Body;
+        const want = Phaser.Math.Angle.Between(b.x, b.y, t.x, t.y);
+        const next = Phaser.Math.Angle.RotateTo(body.velocity.angle(), want, 0.1);
+        this.physics.velocityFromRotation(next, b.getData('speed') as number, body.velocity);
+        b.setRotation(next);
+      }
+      this.burst('player', b.x, b.y, 1); // rastro curto
+    });
+  }
+
+  // corpo a corpo: golpeia sozinho em arco quando há inimigo no alcance
+  private tryMelee(w: Weapon, time: number) {
+    if (time <= this.nextShot) return;
+    const target = this.nearestEnemy(this.player.x, this.player.y, w.range, true);
+    if (!target) return;
+
+    this.nextShot = time + this.weaponDelay(w);
+    this.shotOnce = true;
+
+    const angle = Phaser.Math.Angle.Between(this.player.x, this.player.y, target.x, target.y);
+    if (w.id === 'katana') this.katanaAngle = angle;
+    const half = Phaser.Math.DegToRad(w.arc / 2);
+    const dmg = this.weaponDamage(w);
+
+    this.slash(angle, half, w.range, WEAPON_COLOR[w.id], w.id === 'katana' ? 0.12 : 0.55);
+    sfx.shoot();
+
+    // copia a lista: matar um inimigo remove ele do grupo no meio do laço
+    for (const o of [...this.enemies.getChildren()]) {
+      const e = o as Phaser.Physics.Arcade.Sprite;
+      if (!e.active) continue;
+      if (Phaser.Math.Distance.Between(this.player.x, this.player.y, e.x, e.y) - e.displayWidth / 2 > w.range) continue;
+      const toEnemy = Phaser.Math.Angle.Between(this.player.x, this.player.y, e.x, e.y);
+      if (Math.abs(Phaser.Math.Angle.Wrap(toEnemy - angle)) > half) continue;
+      if (!this.damageEnemy(e, dmg)) this.pushEnemy(e, w.pushMs);
+    }
+  }
+
+  private slash(angle: number, half: number, radius: number, color: number, alpha = 0.55) {
+    const g = this.world(this.add.graphics()).setDepth(5);
+    g.fillStyle(color, alpha);
+    g.slice(this.player.x, this.player.y, radius, angle - half, angle + half, false);
+    g.fillPath();
+    this.tweens.add({ targets: g, alpha: 0, duration: 130, onComplete: () => g.destroy() });
   }
 
   // inimigos perseguem o jogador (mais lentos com o Sandevistan); quem foi empurrado pelo
@@ -527,7 +787,7 @@ export class GameScene extends Phaser.Scene {
       const maxHp = this.ghostEnemy.getData('maxHp') as number;
       this.ghostLabel
         .setPosition(this.ghostEnemy.x, this.ghostEnemy.y - 24)
-        .setText(`FANTASMA [${ROLE_LABEL[this.run.ghostRole]}] ${hp}/${maxHp}`);
+        .setText(`FANTASMA [${ROLE_LABEL[this.run.ghostRole]}] ${Math.ceil(hp)}/${maxHp}`);
     }
   }
 
@@ -658,10 +918,38 @@ export class GameScene extends Phaser.Scene {
             this.slowLeft > 0 ? `ATIVO ${this.slowLeft.toFixed(1)}s` : this.slowCd > 0 ? `recarga ${Math.ceil(this.slowCd)}s` : 'PRONTO'
           }`
         : '';
+    const className = CLASS_LIST.find((c) => c.id === r.classId)?.name ?? '-';
+    const weaponHud =
+      r.weapons.length > 0
+        ? `\n${className}   Arma ${WEAPONS[r.weaponId].name}${
+            r.weapons.length > 1 ? ` (${r.equipped + 1}/${r.weapons.length}, Q troca)` : ''
+          }`
+        : '';
     this.hud.setText(
       `HP ${Math.max(0, Math.round(s.hp))}/${s.maxHp}   Edinhos ${s.edinhos}   Humanidade ${s.humanity}   ` +
-        `Wave ${this.wave}/${TOTAL_WAVES}   Tempo ${time}s${ghostHud}${slowHud}`,
+        `Wave ${this.wave}/${TOTAL_WAVES}   Tempo ${time}s${ghostHud}${weaponHud}${slowHud}`,
     );
+  }
+
+  // =====================================================================
+  // CLASSE
+  // =====================================================================
+  private openClassMenu() {
+    this.state = 'select';
+    const lines = CLASS_LIST.map((c, i) => `[${i + 1}] ${c.name}\n     ${c.desc}`).join('\n\n');
+    this.setMsg(`=== ESCOLHA SUA CLASSE ===\n\n${lines}`);
+  }
+
+  private beginRun(id: ClassId) {
+    this.run.setClass(id);
+    this.state = 'wave';
+    this.physics.resume();
+    this.time.paused = false;
+    this.setMsg('');
+    sfx.click();
+    this.showBanner(`WAVE ${this.wave}`);
+    sfx.waveStart();
+    this.scheduleGhostIfNeeded();
   }
 
   // =====================================================================
@@ -707,8 +995,14 @@ export class GameScene extends Phaser.Scene {
         ? implantEntries.map(([name, count]) => `• ${name} x${count}`).join('\n')
         : 'Nenhum implante instalado';
 
+    const className = CLASS_LIST.find((c) => c.id === this.run.classId)?.name ?? '-';
+    const weaponsText = this.run.weapons
+      .map((id, i) => `• ${WEAPONS[id].name}${i === this.run.equipped ? ' (equipada)' : ''}`)
+      .join('\n');
+
     this.setMsg(
       '=== DADOS DA RUN (BUILD) ===\n\n' +
+        `Classe: ${className}\n` +
         `HP: ${Math.max(0, Math.round(s.hp))}/${s.maxHp}   |   Dano: ${s.damage}\n` +
         `Velocidade: ${s.speed}   |   Cadência: ${s.fireDelay}ms (${shotsPerSec} tiros/s)\n` +
         `Humanidade: ${s.humanity}   |   Edinhos: ${s.edinhos}\n` +
@@ -717,7 +1011,8 @@ export class GameScene extends Phaser.Scene {
         (s.slowmo > 0 ? `Sandevistan: ${slowmoDuration(s.slowmo)}s ativo / ${SLOWMO_COOLDOWN}s recarga\n` : '') +
         (s.mantis > 0 ? `Mantis Blades: corte de ${mantisDamage(s.mantis)} de dano a cada ${MANTIS_INTERVAL}s\n` : '') +
         (s.gorilla > 0 ? `Gorilla Arms: empurrão de ${s.gorilla * 40}px por tiro\n` : '') +
-        `\n--- IMPLANTES ADQUIRIDOS (${this.implants.length}) ---\n${implantsText}\n\n` +
+        `\n--- ARMAS (${this.run.weapons.length}) ---\n${weaponsText}\n\n` +
+        `--- IMPLANTES ADQUIRIDOS (${this.implants.length}) ---\n${implantsText}\n\n` +
         '[1] ou [ESC] Voltar ao menu de pausa',
     );
   }
@@ -750,8 +1045,7 @@ export class GameScene extends Phaser.Scene {
     const { x, y } = this.edgePoint(SPAWN_MIN_DIST, 16, this.run.rng.ghost);
     const gs = ghostStats(this.run.ghost, role, this.wave);
 
-    const g = this.world(this.enemies.create(x, y, 'eg') as Phaser.Physics.Arcade.Sprite);
-    g.setScale(gs.scale);
+    const g = this.prepareActor(this.enemies.create(x, y, 'eg') as Phaser.Physics.Arcade.Sprite, gs.scale);
     g.setData('hp', gs.hp);
     g.setData('maxHp', gs.hp);
     g.setData('mul', gs.mul);
@@ -815,7 +1109,7 @@ export class GameScene extends Phaser.Scene {
     const { x, y } = this.edgePoint(SPAWN_MIN_DIST);
     const type = this.run.pickEnemyType();
     const s = enemyStats(type, this.wave);
-    const e = this.world(this.enemies.create(x, y, ENEMY[type].tex) as Phaser.Physics.Arcade.Sprite);
+    const e = this.prepareActor(this.enemies.create(x, y, ENEMY[type].tex) as Phaser.Physics.Arcade.Sprite);
     e.setData('hp', s.hp);
     e.setData('mul', s.mul);
     e.setData('dmg', s.dmg);
@@ -836,7 +1130,7 @@ export class GameScene extends Phaser.Scene {
       spr.setData('hp', hp);
       spr.setTintFill(PAL.white);
       this.time.delayedCall(60, () => spr.active && spr.clearTint());
-      if (isGhost) this.floatText(spr.x, spr.y - 22, String(dmg), CSS.white, 11);
+      if (isGhost) this.floatText(spr.x, spr.y - 22, fmt(dmg), CSS.white, 11);
       sfx.hit();
       return false;
     }
@@ -858,23 +1152,27 @@ export class GameScene extends Phaser.Scene {
       if (reward >= 10) this.floatText(spr.x, spr.y - 14, `+${reward}`, CSS.teal, 12);
       sfx.kill(fx === 'tank');
     }
+    const shadow = spr.getData('shadow') as Phaser.GameObjects.Image | undefined;
+    shadow?.destroy();
     spr.destroy();
     return true;
   }
 
   // Gorilla Arms: o tiro que não mata empurra o inimigo (o fantasma resiste)
-  private pushEnemy(spr: Phaser.Physics.Arcade.Sprite) {
-    const copies = this.stats.gorilla;
-    if (copies <= 0) return;
+  // (golpes de armas corpo a corpo somam o próprio empurrão: extraMs)
+  private pushEnemy(spr: Phaser.Physics.Arcade.Sprite, extraMs = 0) {
+    const ms = gorillaPushMs(this.stats.gorilla) + extraMs;
+    if (ms <= 0) return;
     const resist = spr.getData('isGhost') ? GHOST_PUSH_RESIST : 1;
-    spr.setData('pushUntil', this.time.now + gorillaPushMs(copies) * resist);
+    spr.setData('pushUntil', this.time.now + ms * resist);
   }
 
   private hitEnemy(b: Phaser.GameObjects.GameObject, e: Phaser.GameObjects.GameObject) {
     if (!b.active || !e.active) return; // duas balas no mesmo frame não podem matar duas vezes
     const spr = e as Phaser.Physics.Arcade.Sprite;
+    const dmg = (b.getData('dmg') as number | undefined) ?? this.stats.damage;
     b.destroy();
-    if (!this.damageEnemy(spr, this.stats.damage)) this.pushEnemy(spr);
+    if (!this.damageEnemy(spr, dmg)) this.pushEnemy(spr);
   }
 
   private hurtPlayer(e: Phaser.GameObjects.GameObject) {
@@ -895,7 +1193,11 @@ export class GameScene extends Phaser.Scene {
     this.cameras.main.shake(120, Phaser.Math.Clamp(dmg * 0.0007, 0.003, 0.012));
     this.burst('player', this.player.x, this.player.y, 6);
     this.player.setTintFill(PAL.pink);
-    this.time.delayedCall(80, () => this.player.active && this.player.clearTint());
+    this.playerVisual?.setTintFill(PAL.pink);
+    this.time.delayedCall(80, () => {
+      if (this.player.active) this.player.clearTint();
+      this.playerVisual?.clearTint();
+    });
     sfx.hurt();
   }
 
@@ -917,6 +1219,10 @@ export class GameScene extends Phaser.Scene {
   }
 
   private endWave() {
+    this.enemies.getChildren().forEach((object) => {
+      const shadow = (object as Phaser.Physics.Arcade.Sprite).getData('shadow') as Phaser.GameObjects.Image | undefined;
+      shadow?.destroy();
+    });
     this.enemies.clear(true, true);
     this.bullets.clear(true, true);
     this.clearGhostVisuals();
@@ -941,15 +1247,24 @@ export class GameScene extends Phaser.Scene {
   }
 
   private showShop(note = '') {
-    const lines = this.run.shopItems
+    const implantLines = this.run.shopItems
       .map((i, n) =>
         i
           ? `[${n + 1}] ${i.name}: ${i.desc}\n     ${this.run.priceOf(i)} edinhos, -${i.humanity} humanidade`
           : `[${n + 1}] --- (instalado)`,
       )
       .join('\n');
+    const weaponLines = this.run.shopWeapons
+      .map((w, n) =>
+        w
+          ? `[${n + 4}] ${w.name} (${KIND_LABEL[w.kind]}): ${w.desc}\n     ${w.price} edinhos`
+          : `[${n + 4}] --- (indisponível)`,
+      )
+      .join('\n');
     this.setMsg(
-      `LOJA (wave ${this.wave} concluída)  Implantes: ${this.implants.length}\n\n${lines}\n\n` +
+      `LOJA (wave ${this.wave} concluída)  Implantes: ${this.implants.length}  Edinhos: ${this.stats.edinhos}\n\n` +
+        `${implantLines}\n\n` +
+        `--- ARMAS (só edinhos) ---\n${weaponLines}\n\n` +
         `[R] reroll (${this.run.rerollCost()} edinhos)   [ESPAÇO] próxima wave\n\n${note}`,
     );
   }
@@ -966,6 +1281,19 @@ export class GameScene extends Phaser.Scene {
     if (res.psycho) return this.finish('CIBERPSICOSE. Você virou o inimigo.', 'psycho');
     sfx.buy();
     this.showShop(`${res.implant.name} instalado.`);
+  }
+
+  private buyWeapon(i: number) {
+    const res = this.run.buyWeapon(i);
+    if (!res.ok) {
+      if (res.reason === 'poor') {
+        sfx.deny();
+        this.showShop('Edinhos insuficientes.');
+      }
+      return;
+    }
+    sfx.buy();
+    this.showShop(`${res.weapon.name} equipada. [Q] troca de arma na wave.`);
   }
 
   // =====================================================================
@@ -990,6 +1318,8 @@ export class GameScene extends Phaser.Scene {
     } else if (kind === 'dead') {
       this.burst('player', this.player.x, this.player.y, 30);
       this.player.setVisible(false);
+      this.playerVisual?.setVisible(false);
+      this.katanaVisual?.setVisible(false);
       this.cameras.main.shake(320, 0.015);
       this.cameras.main.flash(250, 255, 42, 109);
       sfx.death();

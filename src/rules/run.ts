@@ -1,9 +1,11 @@
 // Regras da run SEM Phaser: estado, loja, preços, fantasma e pontuação.
 // A cena só desenha e manda ações para cá. Isso permite testar com `node --test`
 // e simular bots (src/sim/balance.ts) sem abrir navegador.
-import type { EnemyType, Ghost, Implant, Stats } from '../types';
+import type { ClassId, EnemyType, Ghost, Implant, Stats, Weapon, WeaponId } from '../types';
 import { IMPLANTS } from '../data/implants';
 import { ENEMY } from '../data/enemies';
+import { WEAPON_LIST } from '../data/weapons';
+import { CLASSES } from '../data/classes';
 import { Rng } from './rng';
 
 // =====================================================================
@@ -60,6 +62,9 @@ export type WaveStatus = 'running' | 'overtime' | 'done';
 export type BuyResult =
   | { ok: false; reason: 'empty' | 'poor' }
   | { ok: true; implant: Implant; price: number; psycho: boolean };
+export type WeaponBuyResult =
+  | { ok: false; reason: 'empty' | 'poor' }
+  | { ok: true; weapon: Weapon; price: number };
 
 // =====================================================================
 // FUNÇÕES PURAS: implantes
@@ -253,13 +258,19 @@ export function ghostKind(g: Ghost): GhostKind | null {
 export class Run {
   readonly seed: number;
   // fluxos independentes: o que o jogador faz (spawns) nunca muda a loja nem o fantasma
-  readonly rng: { spawn: Rng; shop: Rng; ghost: Rng };
+  readonly rng: { spawn: Rng; shop: Rng; ghost: Rng; weapon: Rng };
 
   stats: Stats = { ...START };
   implants: string[] = [];
   wave = 1;
   shopItems: (Implant | null)[] = [];
+  shopWeapons: (Weapon | null)[] = [];
   rerolls = 0;
+
+  // classe e armas (a classe só vale depois de setClass; sem ela a run usa os stats base)
+  classId: ClassId | null = null;
+  weapons: WeaponId[] = [];
+  equipped = 0;
 
   readonly ghost: Ghost;
   readonly ghostRole: LiveGhostRole;
@@ -273,6 +284,7 @@ export class Run {
       spawn: new Rng(seed ^ 0x9e3779b9),
       shop: new Rng(seed ^ 0x85ebca6b),
       ghost: new Rng(seed ^ 0xc2b2ae35),
+      weapon: new Rng(seed ^ 0x27d4eb2f), // fluxo próprio: o que o jogador tem nunca muda a loja de implantes
     };
     this.usesFallbackGhost = ghosts.length === 0;
     this.ghost = this.rng.ghost.pick(this.usesFallbackGhost ? [FALLBACK_GHOST] : ghosts);
@@ -307,6 +319,27 @@ export class Run {
     return this.stats.hp <= 0;
   }
 
+  // ----- classe e armas -----
+  setClass(id: ClassId) {
+    const c = CLASSES[id];
+    this.classId = id;
+    this.stats.maxHp = c.hp;
+    this.stats.hp = c.hp;
+    this.weapons = [c.weapon];
+    this.equipped = 0;
+  }
+
+  get weaponId(): WeaponId {
+    return this.weapons[this.equipped] ?? 'pistol';
+  }
+
+  /** troca para a próxima arma; false se só há uma */
+  cycleWeapon(): boolean {
+    if (this.weapons.length < 2) return false;
+    this.equipped = (this.equipped + 1) % this.weapons.length;
+    return true;
+  }
+
   // ----- loja -----
   openShop() {
     this.rerolls = 0;
@@ -315,6 +348,9 @@ export class Run {
 
   private rollShop() {
     this.shopItems = this.rng.shop.shuffle(IMPLANTS).slice(0, 3);
+    const pool = WEAPON_LIST.filter((w) => !this.weapons.includes(w.id));
+    const picks = this.rng.weapon.shuffle(pool).slice(0, 2);
+    this.shopWeapons = [picks[0] ?? null, picks[1] ?? null];
   }
 
   /** cada implante já instalado encarece os próximos em 25% */
@@ -346,6 +382,18 @@ export class Run {
     this.implants.push(imp.name);
     this.shopItems[i] = null;
     return { ok: true, implant: imp, price, psycho: this.stats.humanity <= 0 };
+  }
+
+  /** arma custa só edinhos (sem humanidade e sem inflação); já sai equipada */
+  buyWeapon(i: number): WeaponBuyResult {
+    const w = this.shopWeapons[i];
+    if (!w) return { ok: false, reason: 'empty' };
+    if (this.stats.edinhos < w.price) return { ok: false, reason: 'poor' };
+    this.stats.edinhos -= w.price;
+    this.weapons.push(w.id);
+    this.equipped = this.weapons.length - 1;
+    this.shopWeapons[i] = null;
+    return { ok: true, weapon: w, price: w.price };
   }
 
   /** registro salvo quando a run termina em ciberpsicose */

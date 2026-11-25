@@ -89,6 +89,16 @@ const SPRITES: Record<string, SpriteDef> = {
     legend: { w: PAL.white },
     rows: ['ww', 'ww'],
   },
+  // sombra pixelada sob os pés (cada pixel lógico tem 2x2 px)
+  sh: {
+    legend: { s: PAL.panel },
+    rows: ['..sssssss..', '.sssssssss.', '..sssssss..'],
+  },
+  // fallback da katana: lâmina escura com fio claro, guarda e cabo magenta
+  katana: {
+    legend: { p: PAL.pink, k: PAL.panel, d: PAL.cyanDark, c: PAL.cyan, w: PAL.white },
+    rows: ['...........w', '......ddddw.', 'pppppkddddcw', '.......ddddc', '...........d'],
+  },
 };
 
 export function buildSprites(scene: Phaser.Scene) {

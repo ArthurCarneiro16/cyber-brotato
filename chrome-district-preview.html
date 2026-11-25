@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Preview — Chrome District | Cyber Brotato</title>
+    <style>
+      :root { color-scheme: dark; font-family: Consolas, "Courier New", monospace; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; color: #d8e6ef; background: #080a12; }
+      main { width: min(100% - 32px, 920px); margin: 28px auto; }
+      h1 { margin: 0; color: #67f4e2; font-size: 22px; letter-spacing: .06em; }
+      p { color: #9eb1bd; }
+      .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 18px 0 12px; }
+      button { border: 1px solid #37535e; border-radius: 4px; padding: 9px 13px; color: #d8e6ef; background: #111923; font: inherit; cursor: pointer; }
+      button[aria-pressed="true"] { border-color: #67f4e2; color: #67f4e2; background: #112627; }
+      #status { margin-left: auto; color: #67f4e2; }
+      canvas { display: block; width: 100%; height: auto; border: 1px solid #283541; background: #0b111a; image-rendering: pixelated; image-rendering: crisp-edges; }
+      .help { font-size: 13px; line-height: 1.6; }
+      .error { color: #ff7897; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>CHROME DISTRICT / TESTE DE PERSONAGEM</h1>
+      <p>Preview isolado — não altera a cena principal nem os sistemas de gameplay.</p>
+      <div class="toolbar" aria-label="Selecionar personagem">
+        <button id="neon-button" type="button" aria-pressed="true">Neon Jack · Ortho 22°</button>
+        <button id="current-button" type="button" aria-pressed="false">Edgerunner atual</button>
+        <span id="status">Carregando…</span>
+      </div>
+      <canvas id="preview" width="800" height="500" aria-label="Arena de teste de movimento"></canvas>
+      <p class="help">Movimento: <strong>W A S D</strong> (inclui diagonais). Neon Jack: sheet 336×672 px, quadros 56×84 px, 8 direções × 6 quadros, câmera ortho 22°. Edgerunner atual: 32×48 px. Escalas de referência: 0,5× e 0,75×, respectivamente.</p>
+      <p id="error" class="help error" role="alert"></p>
+    </main>
+    <script type="module" src="/src/chromeDistrictPreview.ts"></script>
+  </body>
+</html>

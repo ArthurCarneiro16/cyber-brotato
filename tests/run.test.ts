@@ -3,9 +3,12 @@ import assert from 'node:assert/strict';
 import { Rng } from '../src/rules/rng';
 import { Run, START, TOTAL_WAVES, enemyStats, ghostStats, pickGhostRole, powerScoreOf } from '../src/rules/run';
 import { IMPLANTS } from '../src/data/implants';
+import { WEAPON_LIST, WEAPONS } from '../src/data/weapons';
+import { CLASS_LIST, CLASSES, applyClassToWeapon } from '../src/data/classes';
 import type { Stats } from '../src/types';
 
 const newRun = (seed = 1) => new Run(seed, []);
+const near = (a: number, b: number) => Math.abs(a - b) < 1e-9;
 
 test('Rng: mesma seed repete a sequência e seeds diferentes divergem', () => {
   const a = new Rng(123);
@@ -231,4 +234,181 @@ test('Pontuação de poder sobe com cada melhoria', () => {
   assert.ok(powerScoreOf({ ...START, enemySlow: 0.7 }, 0, 1) > base);
   assert.ok(powerScoreOf(START, 1, 1) > base);
   assert.ok(powerScoreOf(START, 0, 2) > base);
+});
+
+// ---------- armas e classes ----------
+
+test('Armas: ids únicos, preços positivos e campos coerentes com o tipo', () => {
+  assert.equal(WEAPON_LIST.length, 6);
+  assert.equal(new Set(WEAPON_LIST.map((w) => w.id)).size, WEAPON_LIST.length);
+  for (const w of WEAPON_LIST) {
+    assert.equal(WEAPONS[w.id], w, w.id);
+    assert.ok(w.price > 0 && w.damage > 0 && w.delay > 0, w.id);
+    if (w.kind === 'melee') {
+      assert.ok(w.range > 0 && w.arc > 0, `${w.id} corpo a corpo precisa de alcance e arco`);
+      assert.equal(w.pellets, 0, w.id);
+    } else {
+      assert.ok(w.projSpeed > 0 && w.life > 0 && w.pellets >= 1, `${w.id} tiro precisa de projétil`);
+      assert.equal(w.pushMs, 0, w.id);
+    }
+    if (w.kind === 'smart') assert.ok(w.acquire > 0, w.id);
+  }
+});
+
+test('Armas: a escopeta tem 5 projéteis e recebe só metade do bônus de dano', () => {
+  assert.equal(WEAPONS.shotgun.pellets, 5);
+  assert.equal(WEAPONS.shotgun.bonusMul, 0.5);
+});
+
+test('Classes: cada classe aponta para uma arma que existe e o HP bate com o GDD', () => {
+  assert.equal(CLASS_LIST.length, 3);
+  for (const c of CLASS_LIST) {
+    assert.ok(WEAPONS[c.weapon], `${c.id} arma inicial inexistente`);
+    assert.equal(CLASSES[c.id], c);
+  }
+  assert.equal(CLASSES.solo.hp, 120);
+  assert.equal(CLASSES.netrunner.hp, 90);
+  assert.equal(CLASSES.techie.hp, 100);
+});
+
+test('Classe: setClass define HP e arma inicial sem mexer nos outros stats nem nos implantes', () => {
+  for (const c of CLASS_LIST) {
+    const r = newRun();
+    r.setClass(c.id);
+    assert.equal(r.classId, c.id);
+    assert.equal(r.stats.maxHp, c.hp);
+    assert.equal(r.stats.hp, c.hp);
+    assert.deepEqual(r.weapons, [c.weapon]);
+    assert.equal(r.equipped, 0);
+    assert.equal(r.weaponId, c.weapon);
+    // nenhum bônus geral: o resto dos stats continua igual ao START
+    const { hp: _h, maxHp: _m, ...rest } = r.stats;
+    const { hp: _sh, maxHp: _sm, ...startRest } = START;
+    assert.deepEqual(rest, startRest);
+  }
+});
+
+test('Classe: sem setClass a run usa os stats base (simulador e testes antigos seguem iguais)', () => {
+  const r = newRun();
+  assert.equal(r.classId, null);
+  assert.equal(r.stats.maxHp, START.maxHp);
+  assert.equal(r.stats.hp, START.hp);
+  assert.deepEqual(r.weapons, []);
+  assert.equal(r.weaponId, 'pistol'); // fallback
+});
+
+test('Bônus de classe: Solo só melhora arma corpo a corpo (+1 dano)', () => {
+  assert.equal(applyClassToWeapon('solo', WEAPONS.katana).damage, WEAPONS.katana.damage + 1);
+  assert.equal(applyClassToWeapon('solo', WEAPONS.gorilla).damage, WEAPONS.gorilla.damage + 1);
+  assert.equal(applyClassToWeapon('solo', WEAPONS.pistol).damage, WEAPONS.pistol.damage);
+  assert.equal(applyClassToWeapon('solo', WEAPONS.smart).damage, WEAPONS.smart.damage);
+});
+
+test('Bônus de classe: Netrunner só acelera armas de fogo em 10%', () => {
+  assert.ok(near(applyClassToWeapon('netrunner', WEAPONS.pistol).delay, WEAPONS.pistol.delay * 0.9));
+  assert.ok(near(applyClassToWeapon('netrunner', WEAPONS.smg).delay, WEAPONS.smg.delay * 0.9));
+  assert.ok(near(applyClassToWeapon('netrunner', WEAPONS.shotgun).delay, WEAPONS.shotgun.delay * 0.9));
+  assert.equal(applyClassToWeapon('netrunner', WEAPONS.katana).delay, WEAPONS.katana.delay);
+  assert.equal(applyClassToWeapon('netrunner', WEAPONS.smart).delay, WEAPONS.smart.delay);
+});
+
+test('Bônus de classe: Techie só melhora a pistola inteligente (360 px, 460 px/s)', () => {
+  const smart = applyClassToWeapon('techie', WEAPONS.smart);
+  assert.equal(smart.acquire, 360);
+  assert.equal(smart.projSpeed, 460);
+  assert.deepEqual(applyClassToWeapon('techie', WEAPONS.pistol), WEAPONS.pistol);
+  assert.deepEqual(applyClassToWeapon('techie', WEAPONS.katana), WEAPONS.katana);
+});
+
+test('Bônus de classe: sem classe a arma não muda e o original nunca é alterado', () => {
+  const before = JSON.stringify(WEAPONS.katana);
+  assert.deepEqual(applyClassToWeapon(null, WEAPONS.katana), WEAPONS.katana);
+  applyClassToWeapon('solo', WEAPONS.katana);
+  assert.equal(JSON.stringify(WEAPONS.katana), before);
+});
+
+test('Loja de armas: 2 slots, armas distintas e nunca uma que o jogador já tem', () => {
+  const r = newRun(11);
+  r.setClass('solo');
+  r.openShop();
+  assert.equal(r.shopWeapons.length, 2);
+  const [a, b] = r.shopWeapons;
+  assert.ok(a && b);
+  assert.notEqual(a.id, b.id);
+  assert.ok(!r.weapons.includes(a.id));
+  assert.ok(!r.weapons.includes(b.id));
+});
+
+test('Loja de armas: quando o jogador já tem todas, os slots ficam vazios', () => {
+  const r = newRun();
+  r.weapons = WEAPON_LIST.map((w) => w.id);
+  r.openShop();
+  assert.deepEqual(r.shopWeapons, [null, null]);
+  assert.deepEqual(r.buyWeapon(0), { ok: false, reason: 'empty' });
+});
+
+test('Loja de armas: a mesma seed oferece as mesmas armas', () => {
+  const a = newRun(42);
+  const b = newRun(42);
+  for (let i = 0; i < 1000; i++) b.pickEnemyType();
+  a.openShop();
+  b.openShop();
+  assert.deepEqual(
+    a.shopWeapons.map((w) => w?.id),
+    b.shopWeapons.map((w) => w?.id),
+  );
+});
+
+test('Loja de armas: o que o jogador possui nunca muda os implantes oferecidos', () => {
+  const a = newRun(77);
+  const b = newRun(77);
+  b.weapons = ['pistol', 'smg', 'katana']; // b já tem armas, então o sorteio de armas consome menos
+  for (let i = 0; i < 4; i++) {
+    a.openShop();
+    b.openShop();
+    assert.deepEqual(
+      a.shopItems.map((x) => x?.name),
+      b.shopItems.map((x) => x?.name),
+    );
+  }
+});
+
+test('Compra de arma sem edinhos falha e deixa o estado intacto', () => {
+  const r = newRun();
+  r.setClass('netrunner');
+  r.openShop();
+  const before = JSON.stringify({ s: r.stats, w: r.weapons, e: r.equipped });
+  assert.deepEqual(r.buyWeapon(0), { ok: false, reason: 'poor' });
+  assert.equal(JSON.stringify({ s: r.stats, w: r.weapons, e: r.equipped }), before);
+});
+
+test('Compra de arma: só edinhos, sem humanidade, sem inflação, e já sai equipada', () => {
+  const r = newRun(5);
+  r.setClass('solo');
+  r.openShop();
+  r.stats.edinhos = 5000;
+  r.implants = ['a', 'b', 'c', 'd']; // implantes encarecem implantes, nunca armas
+  const w = r.shopWeapons[0]!;
+  const res = r.buyWeapon(0);
+  assert.ok(res.ok);
+  assert.equal(r.stats.edinhos, 5000 - w.price);
+  assert.equal(r.stats.humanity, START.humanity); // nenhum custo de humanidade
+  assert.deepEqual(r.weapons, ['katana', w.id]);
+  assert.equal(r.weaponId, w.id);
+  assert.equal(r.shopWeapons[0], null);
+  assert.deepEqual(r.buyWeapon(0), { ok: false, reason: 'empty' }); // não compra o mesmo slot duas vezes
+});
+
+test('Troca de arma: não troca com uma só e percorre todas em ciclo', () => {
+  const r = newRun();
+  r.setClass('techie');
+  assert.equal(r.cycleWeapon(), false);
+  assert.equal(r.weaponId, 'smart');
+  r.weapons.push('pistol', 'smg');
+  assert.ok(r.cycleWeapon());
+  assert.equal(r.weaponId, 'pistol');
+  assert.ok(r.cycleWeapon());
+  assert.equal(r.weaponId, 'smg');
+  assert.ok(r.cycleWeapon());
+  assert.equal(r.weaponId, 'smart'); // volta ao início
 });
