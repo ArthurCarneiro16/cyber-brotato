@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
 import { Rng } from '../src/rules/rng';
 import { Run, START, TOTAL_WAVES, enemyStats, ghostStats, pickGhostRole, powerScoreOf } from '../src/rules/run';

@@ -1,14 +1,14 @@
 import Phaser from 'phaser';
-import { GameScene } from './GameScene';
-import { CSS } from './palette';
+import { GAME_HEIGHT, GAME_WIDTH, COLORS } from './game/config';
+import { GameScene } from './game/scenes/GameScene';
 
 new Phaser.Game({
   type: Phaser.AUTO,
-  width: 960,
-  height: 540,
-  backgroundColor: CSS.bg,
+  width: GAME_WIDTH,
+  height: GAME_HEIGHT,
+  backgroundColor: COLORS.background,
   pixelArt: true,
-  physics: { default: 'arcade' },
+  physics: { default: 'arcade', arcade: { debug: false } },
   scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH },
   scene: [GameScene],
 });
