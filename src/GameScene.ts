@@ -3,6 +3,8 @@ import type { EnemyType, State } from './types';
 import { ENEMY } from './data/enemies';
 import { loadGhosts, saveGhost } from './storage';
 import { sfx } from './sfx';
+import { CSS, PAL } from './palette';
+import { buildSprites } from './sprites';
 import { Rng, randomSeed } from './rules/rng';
 import {
   BEHAVIOR,
@@ -38,6 +40,7 @@ import type { Behavior, GhostKind, LiveGhostRole } from './rules/run';
 
 // A cena só desenha, lê input e mostra feedback. Estado, loja, preços, fantasma e
 // sorteios vivem em ./rules/run.ts (sem Phaser, testado em tests/run.test.ts).
+// Cores: sempre de ./palette. Sprites: ./sprites.
 
 // =====================================================================
 // CONSTANTES
@@ -54,22 +57,23 @@ type FxKey = EnemyType | 'ghost' | 'player';
 type EndKind = 'dead' | 'win' | 'psycho';
 
 const FX_COLOR: Record<FxKey, number> = {
-  normal: 0xff2a6d,
-  fast: 0xff9e00,
-  tank: 0xb14aed,
-  ghost: 0x05d9e8,
-  player: 0x00f0ff,
+  normal: PAL.pink,
+  fast: PAL.orange,
+  tank: PAL.purple,
+  ghost: PAL.teal,
+  player: PAL.cyan,
 };
 
 // cor do piscar de aviso de cada inimigo com investida
 const TELEGRAPH_COLOR: Record<EnemyType, number> = {
-  normal: 0xffffff,
-  fast: 0xff9e00,
-  tank: 0xb14aed,
+  normal: PAL.white,
+  fast: PAL.orange,
+  tank: PAL.purple,
 };
 
 const W = 960;
 const H = 540;
+const GRID = 32; // grade do chão da arena
 const SPAWN_MIN_DIST = 220; // inimigos não nascem em cima do jogador
 const SPAWN_TELEGRAPH = 450; // ms "fantasma" antes de poder causar dano
 
@@ -188,7 +192,8 @@ export class GameScene extends Phaser.Scene {
     this.cameras.main.ignore(this.uiLayer);
     this.uiCam.ignore(this.worldLayer);
 
-    this.createTextures();
+    buildSprites(this);
+    this.createBackground();
     this.createFx();
 
     this.player = this.world(this.physics.add.sprite(480, 270, 'p').setCollideWorldBounds(true));
@@ -220,31 +225,12 @@ export class GameScene extends Phaser.Scene {
     this.scheduleGhostIfNeeded();
   }
 
-  // placeholders: quadrados coloridos (troca por pixel art depois)
-  private createTextures() {
-    const g = this.add.graphics();
-    const tex = (key: string, color: number, size: number) => {
-      if (this.textures.exists(key)) return;
-      g.clear();
-      g.fillStyle(color);
-      g.fillRect(0, 0, size, size);
-      g.generateTexture(key, size, size);
-    };
-    tex('p', 0x00f0ff, 16);
-    tex('e', 0xff2a6d, 14);
-    tex('ef', 0xff9e00, 10);
-    tex('et', 0xb14aed, 24);
-    tex('b', 0xf5e642, 6);
-    tex('w', 0xffffff, 4); // partículas (recebem tint)
-    if (!this.textures.exists('eg')) {
-      g.clear();
-      g.fillStyle(0x05d9e8);
-      g.fillRect(0, 0, 24, 24);
-      g.fillStyle(0xff2a6d);
-      g.fillRect(4, 4, 16, 16);
-      g.generateTexture('eg', 24, 24);
-    }
-    g.destroy();
+  // chão da arena: grade sutil atrás de tudo
+  private createBackground() {
+    const g = this.world(this.add.graphics().setDepth(-10));
+    g.lineStyle(1, PAL.grid, 1);
+    for (let x = 0; x <= W; x += GRID) g.lineBetween(x, 0, x, H);
+    for (let y = 0; y <= H; y += GRID) g.lineBetween(0, y, W, y);
   }
 
   private createFx() {
@@ -270,28 +256,35 @@ export class GameScene extends Phaser.Scene {
 
   // interface (câmera própria, nunca treme)
   private createUi() {
-    const style = { fontFamily: 'monospace', fontSize: '14px', color: '#9ef' };
-    this.slowOverlay = this.ui(this.add.rectangle(480, 270, W, H, 0x05d9e8, 0.1).setDepth(1).setVisible(false));
+    const style = { fontFamily: 'monospace', fontSize: '14px', color: CSS.text };
+    this.slowOverlay = this.ui(this.add.rectangle(480, 270, W, H, PAL.teal, 0.1).setDepth(1).setVisible(false));
     this.hud = this.ui(this.add.text(10, 8, '', style).setDepth(10));
     this.msgBg = this.ui(
-      this.add.rectangle(480, 270, 10, 10, 0x05050a, 0.82).setStrokeStyle(2, 0x00f0ff, 0.6).setDepth(9).setVisible(false),
+      this.add.rectangle(480, 270, 10, 10, PAL.panel, 0.82).setStrokeStyle(2, PAL.cyan, 0.6).setDepth(9).setVisible(false),
     );
     this.msg = this.ui(this.add.text(480, 270, '', { ...style, fontSize: '20px', align: 'center' }).setOrigin(0.5).setDepth(10));
     this.banner = this.ui(
       this.add
-        .text(480, 96, '', { fontFamily: 'monospace', fontSize: '28px', color: '#00f0ff', stroke: '#05050a', strokeThickness: 4 })
+        .text(480, 96, '', { fontFamily: 'monospace', fontSize: '28px', color: CSS.cyan, stroke: CSS.panel, strokeThickness: 4 })
         .setOrigin(0.5)
         .setDepth(11)
         .setAlpha(0),
     );
     this.hint = this.ui(
       this.add
-        .text(480, 520, 'WASD mover  ·  mouse mira e atira  ·  ESC pausa  ·  M som', { ...style, fontSize: '13px', color: '#7a8fa6' })
+        .text(480, 520, 'WASD mover  ·  mouse mira e atira  ·  ESC pausa  ·  M som', {
+          ...style,
+          fontSize: '13px',
+          color: CSS.textDim,
+        })
         .setOrigin(0.5)
         .setDepth(10),
     );
     this.ui(
-      this.add.text(10, H - 6, `seed ${this.run.seed}`, { ...style, fontSize: '11px', color: '#4a5a6e' }).setOrigin(0, 1).setDepth(10),
+      this.add
+        .text(10, H - 6, `seed ${this.run.seed}`, { ...style, fontSize: '11px', color: CSS.textFaint })
+        .setOrigin(0, 1)
+        .setDepth(10),
     );
   }
 
@@ -302,7 +295,7 @@ export class GameScene extends Phaser.Scene {
     this.updateHud();
 
     if (Phaser.Input.Keyboard.JustDown(this.keys.M)) {
-      this.showBanner(sfx.toggleMute() ? 'SOM LIGADO' : 'SOM DESLIGADO', '#9ef', 900);
+      this.showBanner(sfx.toggleMute() ? 'SOM LIGADO' : 'SOM DESLIGADO', CSS.text, 900);
     }
 
     if (this.state === 'over') {
@@ -412,6 +405,7 @@ export class GameScene extends Phaser.Scene {
       this.shotOnce = true;
       const angle = Phaser.Math.Angle.Between(this.player.x, this.player.y, p.worldX, p.worldY);
       const b = this.world(this.bullets.create(this.player.x, this.player.y, 'b') as Phaser.Physics.Arcade.Sprite);
+      b.setRotation(angle);
       this.physics.velocityFromRotation(angle, 520, b.body!.velocity);
       this.time.delayedCall(900, () => b.active && b.destroy());
       sfx.shoot();
@@ -462,7 +456,7 @@ export class GameScene extends Phaser.Scene {
 
     if (beh.phase === 'windup') {
       const k = beh.t / cfg.windup; // 0 -> 1: pisca cada vez mais rápido
-      spr.setTintFill(Math.floor(now / (110 - 70 * k)) % 2 ? 0xffffff : TELEGRAPH_COLOR[type]);
+      spr.setTintFill(Math.floor(now / (110 - 70 * k)) % 2 ? PAL.white : TELEGRAPH_COLOR[type]);
       if (type === 'tank') spr.setScale(1 + 0.3 * k);
     }
 
@@ -493,7 +487,7 @@ export class GameScene extends Phaser.Scene {
 
     if (beh.phase === 'windup') {
       const k = beh.t / cfg.windup;
-      spr.setTintFill(Math.floor(now / (110 - 70 * k)) % 2 ? 0xffffff : 0xff2a6d);
+      spr.setTintFill(Math.floor(now / (110 - 70 * k)) % 2 ? PAL.white : PAL.pink);
     }
 
     if (m === 0) {
@@ -509,7 +503,7 @@ export class GameScene extends Phaser.Scene {
   private ghostAction(spr: Phaser.Physics.Arcade.Sprite, kind: GhostKind) {
     if (kind === 'sandevistan') return; // o dash é o próprio movimento
     const radius = kind === 'mantis' ? GHOST_MANTIS_RADIUS : GHOST_SLAM_RADIUS;
-    const color = kind === 'mantis' ? 0x00f0ff : 0xff9e00;
+    const color = kind === 'mantis' ? PAL.cyan : PAL.orange;
 
     const ring = this.world(this.add.graphics().setDepth(15));
     ring.fillStyle(color, 0.35);
@@ -545,7 +539,7 @@ export class GameScene extends Phaser.Scene {
       this.timeLeft = 0;
       if (!this.overtime) {
         this.overtime = true;
-        this.showBanner('DERROTE O FANTASMA PARA VENCER', '#ff2a6d', 0);
+        this.showBanner('DERROTE O FANTASMA PARA VENCER', CSS.pink, 0);
       }
     } else if (status === 'done') {
       this.endWave();
@@ -565,7 +559,7 @@ export class GameScene extends Phaser.Scene {
     }
     this.slowLeft = slowmoDuration(copies);
     this.slowOverlay.setVisible(true);
-    this.showBanner('SANDEVISTAN', '#05d9e8', 500);
+    this.showBanner('SANDEVISTAN', CSS.teal, 500);
     sfx.waveStart();
   }
 
@@ -601,7 +595,7 @@ export class GameScene extends Phaser.Scene {
 
     // leque ciano que some rápido
     const gfx = this.world(this.add.graphics().setDepth(15));
-    gfx.fillStyle(0x00f0ff, 0.55);
+    gfx.fillStyle(PAL.cyan, 0.55);
     gfx.slice(px, py, MANTIS_RANGE, aim - MANTIS_ARC / 2, aim + MANTIS_ARC / 2, false);
     gfx.fillPath();
     this.tweens.add({ targets: gfx, alpha: 0, duration: 140, onComplete: () => gfx.destroy() });
@@ -617,14 +611,14 @@ export class GameScene extends Phaser.Scene {
   private floatText(x: number, y: number, text: string, color: string, size = 12) {
     const t = this.world(
       this.add
-        .text(x, y, text, { fontFamily: 'monospace', fontSize: `${size}px`, color, stroke: '#05050a', strokeThickness: 3 })
+        .text(x, y, text, { fontFamily: 'monospace', fontSize: `${size}px`, color, stroke: CSS.panel, strokeThickness: 3 })
         .setOrigin(0.5)
         .setDepth(20),
     );
     this.tweens.add({ targets: t, y: y - 26, alpha: 0, duration: 700, onComplete: () => t.destroy() });
   }
 
-  private showBanner(text: string, color = '#00f0ff', holdMs = 1400) {
+  private showBanner(text: string, color: string = CSS.cyan, holdMs = 1400) {
     this.bannerTween?.stop();
     this.bannerTween = null;
     this.banner.setText(text).setColor(color).setAlpha(1).setScale(1.25);
@@ -775,12 +769,12 @@ export class GameScene extends Phaser.Scene {
 
     this.ghostLabel = this.world(
       this.add
-        .text(x, y - 24, '', { fontFamily: 'monospace', fontSize: '12px', color: '#ff2a6d', backgroundColor: '#050814' })
+        .text(x, y - 24, '', { fontFamily: 'monospace', fontSize: '12px', color: CSS.pink, backgroundColor: CSS.label })
         .setOrigin(0.5)
         .setDepth(9),
     );
 
-    this.showBanner(`CIBERPSICOPATA DETECTADO [${ROLE_LABEL[role]}]`, '#ff2a6d', 2200);
+    this.showBanner(`CIBERPSICOPATA DETECTADO [${ROLE_LABEL[role]}]`, CSS.pink, 2200);
     sfx.ghost();
   }
 
@@ -840,9 +834,9 @@ export class GameScene extends Phaser.Scene {
 
     if (hp > 0) {
       spr.setData('hp', hp);
-      spr.setTintFill(0xffffff);
+      spr.setTintFill(PAL.white);
       this.time.delayedCall(60, () => spr.active && spr.clearTint());
-      if (isGhost) this.floatText(spr.x, spr.y - 22, String(dmg), '#ffffff', 11);
+      if (isGhost) this.floatText(spr.x, spr.y - 22, String(dmg), CSS.white, 11);
       sfx.hit();
       return false;
     }
@@ -856,12 +850,12 @@ export class GameScene extends Phaser.Scene {
       this.cameras.main.shake(260, 0.012);
       this.cameras.main.zoomTo(1.05, 80);
       this.time.delayedCall(90, () => this.cameras.main.zoomTo(1, 180));
-      this.floatText(spr.x, spr.y - 20, `+${reward}`, '#05d9e8', 16);
-      this.showBanner('FANTASMA ELIMINADO', '#05d9e8', 1600);
+      this.floatText(spr.x, spr.y - 20, `+${reward}`, CSS.teal, 16);
+      this.showBanner('FANTASMA ELIMINADO', CSS.teal, 1600);
       sfx.ghostDown();
     } else {
       this.burst(fx, spr.x, spr.y, fx === 'tank' ? 12 : 6);
-      if (reward >= 10) this.floatText(spr.x, spr.y - 14, `+${reward}`, '#05d9e8', 12);
+      if (reward >= 10) this.floatText(spr.x, spr.y - 14, `+${reward}`, CSS.teal, 12);
       sfx.kill(fx === 'tank');
     }
     spr.destroy();
@@ -900,7 +894,7 @@ export class GameScene extends Phaser.Scene {
     // o golpe pesa conforme o dano
     this.cameras.main.shake(120, Phaser.Math.Clamp(dmg * 0.0007, 0.003, 0.012));
     this.burst('player', this.player.x, this.player.y, 6);
-    this.player.setTintFill(0xff2a6d);
+    this.player.setTintFill(PAL.pink);
     this.time.delayedCall(80, () => this.player.active && this.player.clearTint());
     sfx.hurt();
   }
