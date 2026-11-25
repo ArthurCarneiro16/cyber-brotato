@@ -164,7 +164,7 @@ export function ghostStats(ghost: Ghost, role: LiveGhostRole, wave: number) {
 export type Phase = 'chase' | 'windup' | 'dash' | 'recover';
 export type Behavior = { phase: Phase; t: number }; // t = segundos na fase atual
 
-type BehaviorConfig = {
+export type BehaviorConfig = {
   trigger: number; // px: só começa o aviso a esta distância do jogador
   chaseMin: number; // s perseguindo antes de poder avisar de novo
   windup: number; // s parado, avisando
@@ -182,10 +182,8 @@ export const BEHAVIOR: Partial<Record<EnemyType, BehaviorConfig>> = {
 
 export const newBehavior = (): Behavior => ({ phase: 'chase', t: 0 });
 
-/** avança a máquina de fases e devolve o multiplicador de velocidade do instante */
-export function stepBehavior(type: EnemyType, b: Behavior, dist: number, dt: number): number {
-  const c = BEHAVIOR[type];
-  if (!c) return 1;
+/** avança a máquina de fases com uma config qualquer e devolve o multiplicador de velocidade */
+export function stepBehaviorCfg(c: BehaviorConfig, b: Behavior, dist: number, dt: number): number {
   b.t += dt;
   switch (b.phase) {
     case 'chase':
@@ -215,10 +213,37 @@ export function stepBehavior(type: EnemyType, b: Behavior, dist: number, dt: num
   }
 }
 
+/** avança a máquina de fases de um inimigo comum */
+export function stepBehavior(type: EnemyType, b: Behavior, dist: number, dt: number): number {
+  const c = BEHAVIOR[type];
+  return c ? stepBehaviorCfg(c, b, dist, dt) : 1;
+}
+
 /** dano de contato fica maior durante a investida */
 export function behaviorDmgMul(type: EnemyType | null | undefined, b: Behavior): number {
   const c = type ? BEHAVIOR[type] : undefined;
   return c && b.phase === 'dash' ? c.dashDmg : 1;
+}
+
+// ---------- fantasma: comportamento pelos implantes que ele tinha ----------
+export type GhostKind = 'mantis' | 'sandevistan' | 'gorilla';
+
+export const GHOST_BEHAVIOR: Record<GhostKind, BehaviorConfig> = {
+  mantis: { trigger: 80, chaseMin: 2.5, windup: 0.6, dash: 0.15, dashMul: 0, recover: 0.8, recoverMul: 0.5, dashDmg: 1 },
+  sandevistan: { trigger: 300, chaseMin: 2, windup: 0.4, dash: 0.25, dashMul: 4, recover: 0.7, recoverMul: 0.4, dashDmg: 1 },
+  gorilla: { trigger: 90, chaseMin: 3, windup: 0.8, dash: 0.15, dashMul: 0, recover: 1.0, recoverMul: 0.5, dashDmg: 1 },
+};
+
+export const GHOST_MANTIS_RADIUS = 70; // px do corte em volta do fantasma
+export const GHOST_SLAM_RADIUS = 100; // px da onda de choque
+export const GHOST_SLAM_PUSH_MS = 250; // ms que o jogador é empurrado
+
+/** qual comportamento o fantasma usa (null = só persegue) */
+export function ghostKind(g: Ghost): GhostKind | null {
+  if (g.implants.includes('Mantis Blades')) return 'mantis';
+  if (g.implants.includes('Sandevistan Lite')) return 'sandevistan';
+  if (g.implants.includes('Gorilla Arms')) return 'gorilla';
+  return null;
 }
 
 // =====================================================================

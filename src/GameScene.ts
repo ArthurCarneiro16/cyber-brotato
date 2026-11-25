@@ -6,7 +6,11 @@ import { sfx } from './sfx';
 import { Rng, randomSeed } from './rules/rng';
 import {
   BEHAVIOR,
+  GHOST_BEHAVIOR,
+  GHOST_MANTIS_RADIUS,
   GHOST_PUSH_RESIST,
+  GHOST_SLAM_PUSH_MS,
+  GHOST_SLAM_RADIUS,
   GORILLA_PUSH_SPEED,
   MANTIS_ARC,
   MANTIS_INTERVAL,
@@ -21,14 +25,16 @@ import {
   behaviorDmgMul,
   enemySpeed,
   enemyStats,
+  ghostKind,
   ghostStats,
   gorillaPushMs,
   mantisDamage,
   newBehavior,
   slowmoDuration,
   stepBehavior,
+  stepBehaviorCfg,
 } from './rules/run';
-import type { Behavior, LiveGhostRole } from './rules/run';
+import type { Behavior, GhostKind, LiveGhostRole } from './rules/run';
 
 // A cena só desenha, lê input e mostra feedback. Estado, loja, preços, fantasma e
 // sorteios vivem em ./rules/run.ts (sem Phaser, testado em tests/run.test.ts).
@@ -97,6 +103,8 @@ export class GameScene extends Phaser.Scene {
   private overtime = false;
   private nextShot = 0;
   private iframeUntil = 0;
+  private playerPushUntil = 0; // onda de choque do fantasma Gorilla
+  private playerPushAngle = 0;
   private movedOnce = false;
   private shotOnce = false;
   private hintDone = false;
@@ -150,6 +158,7 @@ export class GameScene extends Phaser.Scene {
     this.overtime = false;
     this.nextShot = 0;
     this.iframeUntil = 0;
+    this.playerPushUntil = 0;
     this.movedOnce = false;
     this.shotOnce = false;
     this.hintDone = false;
@@ -383,14 +392,18 @@ export class GameScene extends Phaser.Scene {
     const now = this.time.now;
     this.player.setAlpha(now < this.iframeUntil && Math.floor(now / 70) % 2 ? 0.25 : 1);
 
-    // movimento WASD
+    // movimento WASD (a onda de choque do fantasma Gorilla sobrescreve por um instante)
     const dir = new Phaser.Math.Vector2(
       Number(this.keys.D.isDown) - Number(this.keys.A.isDown),
       Number(this.keys.S.isDown) - Number(this.keys.W.isDown),
     );
     if (dir.lengthSq() > 0) this.movedOnce = true;
-    dir.normalize().scale(this.stats.speed);
-    this.player.setVelocity(dir.x, dir.y);
+    if (now < this.playerPushUntil) {
+      this.physics.velocityFromRotation(this.playerPushAngle, 380, this.player.body!.velocity);
+    } else {
+      dir.normalize().scale(this.stats.speed);
+      this.player.setVelocity(dir.x, dir.y);
+    }
 
     // tiro com mouse (segurar o botão); com o Sandevistan ativo a cadência sobe
     const p = this.input.activePointer;
@@ -406,7 +419,7 @@ export class GameScene extends Phaser.Scene {
   }
 
   // inimigos perseguem o jogador (mais lentos com o Sandevistan); quem foi empurrado pelo
-  // Gorilla Arms se afasta por um instante; fast e tank seguem a máquina aviso -> investida
+  // Gorilla Arms se afasta por um instante; fast, tank e fantasma seguem a máquina aviso -> ação
   private updateEnemies(dt: number, now: number) {
     const slow = this.slowLeft > 0 ? SLOWMO_FACTOR : 1;
     const base = enemySpeed(this.wave, this.stats.enemySlow) * slow;
@@ -414,9 +427,12 @@ export class GameScene extends Phaser.Scene {
       const spr = e as Phaser.Physics.Arcade.Sprite;
       const speed = base * (spr.getData('mul') as number);
       const type = spr.getData('type') as EnemyType | undefined;
+      const gkind = spr.getData('gkind') as GhostKind | undefined;
       if (now < ((spr.getData('pushUntil') as number | undefined) ?? 0)) {
         const away = Phaser.Math.Angle.Between(this.player.x, this.player.y, spr.x, spr.y);
         this.physics.velocityFromRotation(away, GORILLA_PUSH_SPEED, spr.body!.velocity);
+      } else if (gkind) {
+        this.moveGhost(spr, gkind, speed, dt * slow, now);
       } else if (type && BEHAVIOR[type]) {
         this.moveWithBehavior(spr, type, speed, dt * slow, now);
       } else {
@@ -457,6 +473,58 @@ export class GameScene extends Phaser.Scene {
     } else {
       this.physics.moveToObject(spr, this.player, speed * m);
     }
+  }
+
+  // fantasma: mesma máquina de fases, com a ação decidida pelos implantes que ele tinha
+  private moveGhost(spr: Phaser.Physics.Arcade.Sprite, kind: GhostKind, speed: number, dt: number, now: number) {
+    const cfg = GHOST_BEHAVIOR[kind];
+    const beh = spr.getData('beh') as Behavior;
+    const prev = beh.phase;
+    const dist = Phaser.Math.Distance.Between(spr.x, spr.y, this.player.x, this.player.y);
+    const m = stepBehaviorCfg(cfg, beh, dist, dt);
+
+    if (beh.phase !== prev) {
+      spr.clearTint();
+      if (beh.phase === 'dash') {
+        spr.setData('heading', Phaser.Math.Angle.Between(spr.x, spr.y, this.player.x, this.player.y));
+        this.ghostAction(spr, kind);
+      }
+    }
+
+    if (beh.phase === 'windup') {
+      const k = beh.t / cfg.windup;
+      spr.setTintFill(Math.floor(now / (110 - 70 * k)) % 2 ? 0xffffff : 0xff2a6d);
+    }
+
+    if (m === 0) {
+      spr.setVelocity(0, 0);
+    } else if (beh.phase === 'dash') {
+      this.physics.velocityFromRotation(spr.getData('heading') as number, speed * m, spr.body!.velocity);
+    } else {
+      this.physics.moveToObject(spr, this.player, speed * m);
+    }
+  }
+
+  // o que o fantasma faz no instante em que o aviso termina
+  private ghostAction(spr: Phaser.Physics.Arcade.Sprite, kind: GhostKind) {
+    if (kind === 'sandevistan') return; // o dash é o próprio movimento
+    const radius = kind === 'mantis' ? GHOST_MANTIS_RADIUS : GHOST_SLAM_RADIUS;
+    const color = kind === 'mantis' ? 0x00f0ff : 0xff9e00;
+
+    const ring = this.world(this.add.graphics().setDepth(15));
+    ring.fillStyle(color, 0.35);
+    ring.fillCircle(spr.x, spr.y, radius);
+    ring.lineStyle(2, color, 0.9);
+    ring.strokeCircle(spr.x, spr.y, radius);
+    this.tweens.add({ targets: ring, alpha: 0, duration: 220, onComplete: () => ring.destroy() });
+
+    if (Phaser.Math.Distance.Between(spr.x, spr.y, this.player.x, this.player.y) > radius) return;
+    if (kind === 'gorilla') {
+      this.playerPushAngle = Phaser.Math.Angle.Between(spr.x, spr.y, this.player.x, this.player.y);
+      this.playerPushUntil = this.time.now + GHOST_SLAM_PUSH_MS;
+      this.cameras.main.shake(200, 0.01);
+    }
+    this.damagePlayer(spr.getData('dmg') as number);
   }
 
   private updateGhostLabel() {
@@ -697,6 +765,11 @@ export class GameScene extends Phaser.Scene {
     g.setData('reward', gs.reward);
     g.setData('isGhost', true);
     g.setData('fx', 'ghost');
+    const kind = ghostKind(this.run.ghost);
+    if (kind) {
+      g.setData('gkind', kind);
+      g.setData('beh', newBehavior());
+    }
     this.armEnemy(g, 800);
     this.ghostEnemy = g;
 
@@ -811,11 +884,16 @@ export class GameScene extends Phaser.Scene {
   }
 
   private hurtPlayer(e: Phaser.GameObjects.GameObject) {
+    if (this.time.now < ((e.getData('armedAt') as number | undefined) ?? 0)) return; // ainda está nascendo
+    const beh = e.getData('beh') as Behavior | undefined;
+    const type = e.getData('type') as EnemyType | undefined;
+    this.damagePlayer((e.getData('dmg') as number) * (beh && type ? behaviorDmgMul(type, beh) : 1));
+  }
+
+  // dano no jogador (contato ou ação do fantasma), respeitando os i-frames
+  private damagePlayer(dmg: number) {
     const now = this.time.now;
     if (now < this.iframeUntil || this.state !== 'wave') return;
-    if (now < ((e.getData('armedAt') as number | undefined) ?? 0)) return; // ainda está nascendo
-    const beh = e.getData('beh') as Behavior | undefined;
-    const dmg = (e.getData('dmg') as number) * (beh ? behaviorDmgMul(e.getData('type') as EnemyType | undefined, beh) : 1);
     this.iframeUntil = now + 500;
     if (this.run.hurt(dmg)) return this.finish('Você morreu na rua.', 'dead');
 
@@ -837,6 +915,7 @@ export class GameScene extends Phaser.Scene {
     this.state = 'wave';
     this.resetSlow(); // a ativa começa pronta em toda wave
     this.slashCd = 0;
+    this.playerPushUntil = 0;
     this.setMsg('');
     this.showBanner(`WAVE ${n}`);
     sfx.waveStart();
