@@ -1,8 +1,7 @@
-import { resolve } from 'node:path';
-import { defineConfig } from 'vitest/config';
+﻿import { defineConfig } from 'vitest/config';
 
+// publicDir padrão (./public): os assets saem em /assets/... exatamente como o jogo e o preview pedem.
 export default defineConfig({
-  publicDir: resolve(process.cwd(), 'public/assets/characters/edgerunner'),
   test: {
     include: ['tests/**/*.test.ts'],
     environment: 'node',
